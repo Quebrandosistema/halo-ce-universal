@@ -550,4 +550,41 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
     brokers = BUILD / "brokers.txt"
     n.build(outputs=brokers, rule="windows_copy", inputs=Path("port/assets/network/brokers.txt"))
     n.build(outputs="windows", rule="phony", inputs=[output, sdl_dll, brokers])
+
+    # the Direct3D 11 probe (port/windows/D3D11.md, phase 0): one Windows-facing
+    # unit, a console program; not part of `windows`
+    probe_source = PORT_DIR / "d3d11" / "win32_d3d11_probe.c"
+    probe_obj = obj_dir / "d3d11_probe" / "win32_d3d11_probe.o"
+    probe_exe = BUILD / "d3d11_probe.exe"
+    # the commit it is built from, written at every build and restat, as the
+    # Android probe's (tools/android_build_stamp.py)
+    probe_stamp = BUILD / "d3d11_probe_build.h"
+    n.rule(
+        name="windows_build_stamp",
+        command="$python tools/android_build_stamp.py $out",
+        description="WINDOWS BUILD STAMP $out",
+        restat=True,
+    )
+    n.build(outputs="windows_always", rule="phony")
+    n.build(outputs=probe_stamp, rule="windows_build_stamp", implicit=["windows_always"])
+    n.build(
+        outputs=probe_obj,
+        rule="windows_cc",
+        inputs=probe_source,
+        implicit=[probe_stamp],
+        variables={"cflags": " ".join([abi, *WIN32_FLAGS, f"-I{BUILD}", f"-I{_quote(sdl_include)}"])},
+    )
+    n.build(
+        outputs=probe_exe,
+        rule="windows_link",
+        inputs=[probe_obj],
+        variables={
+            "ldflags": " ".join(["--target=i686-pc-windows-msvc", "-fuse-ld=lld", "-g", "-Wl,/SUBSYSTEM:CONSOLE",
+                                       # the game's address space, as halo.exe has it
+                                       "-Wl,/LARGEADDRESSAWARE"]),
+            "libs": " ".join([_quote(SDL_DIR / "lib" / "x86" / "SDL3.lib")]
+                             + [f"-l{lib}" for lib in ("d3d11", "dxgi", "dxguid", "user32", "advapi32", "version")]),
+        },
+    )
+    n.build(outputs="windows_d3d11_probe", rule="phony", inputs=[probe_exe, sdl_dll])
     n.newline()

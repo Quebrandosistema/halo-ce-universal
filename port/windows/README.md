@@ -162,6 +162,14 @@ build, set the `HALO_CRASH_REPORTS_ANY_BUILD` environment variable.
 The crash reports also include the crashes of `abort()` and of an invalid
 argument to a function of the C runtime.
 
+## Find problems
+
+`build\windows\d3d11_probe.exe` (built by `ninja windows_d3d11_probe`)
+reports what Direct3D 11 offers on this computer: the graphics adapters,
+the formats, the costs of the shader compiler and of buffers, and the
+behaviour of a window that presents. It writes `d3d11_probe.txt` in the
+current folder. Refer to [d3d11/README.md](d3d11/README.md).
+
 ## Limits
 
 - Bink video is not available. The game skips the movies.
