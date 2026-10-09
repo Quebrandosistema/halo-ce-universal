@@ -1,0 +1,424 @@
+probe.start: all
+build.git: d071462e+changes
+machine.native_system_info: x64 (8 processors)
+machine.is_wow64_process2: process x86 (0x014c), native arm64 (0xaa64)
+machine.processor: Snapdragon(R) X Plus - X1P42100 - Qualcomm(R) Oryon(TM) CPU
+machine.os: Windows 10.0.26200
+timing.thread_cpu_step: 15.6250 ms (the smallest change of GetThreadTimes seen)
+timing.counter_frequency: 10000000 Hz
+probe.steps_asked: all
+probe.adapter_asked: hardware
+probe.sync_asked: 1
+probe.report: C:\Users\carlo\Projects\halo-ce-universal\build\windows\probe_runs\adreno_sync1.txt
+dxgi.factory6: yes
+adapter.0.description: Qualcomm(R) Adreno(TM) X1-45 GPU
+adapter.0.vendor_id: 0x4d4f4351
+adapter.0.device_id: 0x37314430
+adapter.0.subsys_id: 0x33343031, revision 1
+adapter.0.dedicated_video_memory: 128.0 MB
+adapter.0.dedicated_system_memory: 0.0 MB
+adapter.0.shared_system_memory: 3967.9 MB
+adapter.0.software: no
+adapter.0.driver_version: 31.0.137.0
+adapter.1.description: Microsoft Basic Render Driver
+adapter.1.vendor_id: 0x1414
+adapter.1.device_id: 0x008c
+adapter.1.subsys_id: 0x00000000, revision 0
+adapter.1.dedicated_video_memory: 0.0 MB
+adapter.1.dedicated_system_memory: 0.0 MB
+adapter.1.shared_system_memory: 4095.9 MB
+adapter.1.software: yes
+adapter.1.driver_version: 10.0.26100.9444
+adapter.chosen_by: IDXGIFactory6::EnumAdapterByGpuPreference(HIGH_PERFORMANCE), position 0, the first that is not software
+address_space.before_device: 3849.7 MB available of 4095.9 MB virtual
+device.create_time: 30.995 ms (both attempts)
+debug_layer: no (0x887a002d DXGI_ERROR_SDK_COMPONENT_MISSING)
+device.feature_level: 11_1
+address_space.after_device: 3754.3 MB available of 4095.9 MB virtual
+address_space.device_cost: 95.4 MB
+device.adapter: Qualcomm(R) Adreno(TM) X1-45 GPU (vendor 0x4d4f4351, device 0x37314430)
+device.on_qualcomm: yes
+probe.setup: ok
+step.caps: start
+caps.feature_level: 11_1
+caps.feature_level_11_0_or_better: yes
+caps.interface.ID3D11Device1: yes
+caps.interface.ID3D11Device2: yes
+caps.interface.ID3D11Device3: yes
+caps.interface.ID3D11Device4: yes
+caps.interface.ID3D11Device5: yes
+caps.interface.ID3D11DeviceContext1: yes
+caps.interface.ID3D11DeviceContext2: yes
+caps.interface.ID3D11DeviceContext3: yes
+caps.interface.ID3D11DeviceContext4: yes
+caps.interface.IDXGIFactory2: yes
+caps.interface.IDXGIFactory5: yes
+caps.interface.IDXGIFactory6: yes
+caps.threading.concurrent_creates: yes
+caps.threading.command_lists: no
+caps.options.map_no_overwrite_on_dynamic_constant_buffer: yes
+caps.options.map_no_overwrite_on_dynamic_buffer_srv: yes
+caps.options.constant_buffer_offsetting: yes
+caps.options.constant_buffer_partial_update: yes
+caps.options.output_merger_logic_op: yes
+caps.options.discard_apis_seen_by_driver: yes
+caps.options.flags_for_update_and_copy_seen_by_driver: yes
+caps.options.clear_view: yes
+caps.options.copy_with_overlap: yes
+caps.options.multisample_rtv_with_forced_sample_count_one: yes
+caps.options1.tiled_resources_tier: 0
+caps.options2.map_on_default_textures: yes
+caps.options2.unified_memory_architecture: yes
+caps.options2.typed_uav_load_additional_formats: yes
+caps.options2.rovs_supported: no
+caps.options2.standard_swizzle: no
+caps.d3d9_options1.full_non_pow2_texture_supported: yes
+caps.d3d9_options1.depth_as_texture_with_less_equal_comparison_filter: yes
+caps.d3d9_options1.simple_instancing: yes
+caps.d3d9_options1.texture_cube_face_render_target_with_non_cube_depth_stencil: yes
+caps.format.B8G8R8A8_UNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve display ia_vertex_buffer
+caps.format.R8G8B8A8_UNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve display ia_vertex_buffer
+caps.format.B8G8R8X8_UNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve ia_vertex_buffer
+caps.format.B5G6R5_UNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve
+caps.format.B5G5R5A1_UNORM: texture2d texture3d texturecube shader_sample multisample_resolve
+caps.format.B4G4R4A4_UNORM: texture2d texture3d texturecube shader_sample multisample_resolve
+caps.format.R8_UNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve ia_vertex_buffer
+caps.format.R8G8_UNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve ia_vertex_buffer
+caps.format.A8_UNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve
+caps.format.R16_UNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve ia_vertex_buffer
+caps.format.R16G16_UNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve ia_vertex_buffer
+caps.format.R8G8_SNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve ia_vertex_buffer
+caps.format.R16G16_SNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve ia_vertex_buffer
+caps.format.BC1_UNORM: texture2d texture3d texturecube shader_sample
+caps.format.BC2_UNORM: texture2d texture3d texturecube shader_sample
+caps.format.BC3_UNORM: texture2d texture3d texturecube shader_sample
+caps.format.D24_UNORM_S8_UINT: texture2d texturecube depth_stencil multisample_rendertarget
+caps.format.D32_FLOAT_S8X24_UINT: texture2d texturecube depth_stencil multisample_rendertarget
+caps.format.D16_UNORM: texture2d texturecube depth_stencil multisample_rendertarget
+caps.format.D32_FLOAT: texture2d texturecube depth_stencil multisample_rendertarget
+caps.format.R16_UINT: texture2d texture3d texturecube render_target multisample_rendertarget ia_vertex_buffer ia_index_buffer
+caps.format.R32_FLOAT: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve ia_vertex_buffer
+caps.format.R32G32_FLOAT: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve ia_vertex_buffer
+caps.format.R32G32B32_FLOAT: texture2d texture3d texturecube multisample_resolve ia_vertex_buffer
+caps.format.R32G32B32A32_FLOAT: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve ia_vertex_buffer
+caps.format.R16_SINT: texture2d texture3d texturecube render_target multisample_rendertarget ia_vertex_buffer
+caps.format.R16G16_SINT: texture2d texture3d texturecube render_target multisample_rendertarget ia_vertex_buffer
+caps.format.R16G16B16A16_SINT: texture2d texture3d texturecube render_target multisample_rendertarget ia_vertex_buffer
+caps.format.R16_SNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve ia_vertex_buffer
+caps.format.R16G16B16A16_SNORM: texture2d texture3d texturecube shader_sample mip_autogen render_target blendable multisample_rendertarget multisample_resolve ia_vertex_buffer
+caps.format.R8G8B8A8_UINT: texture2d texture3d texturecube render_target multisample_rendertarget ia_vertex_buffer
+caps.format.R32_UINT: texture2d texture3d texturecube render_target multisample_rendertarget ia_vertex_buffer ia_index_buffer
+caps.msaa.B8G8R8A8_UNORM: 2x 1 levels, 4x 1 levels, 8x 1 levels
+caps.msaa.R8G8B8A8_UNORM: 2x 1 levels, 4x 1 levels, 8x 1 levels
+caps.msaa.D24_UNORM_S8_UINT: 2x 1 levels, 4x 1 levels, 8x 1 levels
+caps.msaa.D32_FLOAT_S8X24_UINT: 2x 1 levels, 4x 1 levels, 8x 1 levels
+caps.msaa.D32_FLOAT: 2x 1 levels, 4x 1 levels, 8x 1 levels
+caps.limit.constant_buffer_float4s: 4096 (vertex constants need 192)
+caps.limit.constant_buffer_slots: 14
+caps.limit.input_slots: 32 (the Xbox has 16)
+caps.limit.input_elements: 32
+caps.limit.sampler_slots: 16
+caps.limit.shader_resource_slots: 128
+caps.limit.render_targets: 8
+caps.limit.texture2d_dimension: 16384
+caps.limit.texture3d_dimension: 2048
+caps.limit.texturecube_dimension: 16384
+caps.limit.max_anisotropy: 16
+caps.limit.resource_size_mb: 128 (D3D11_REQ_RESOURCE_SIZE_IN_MEGABYTES_EXPRESSION_A_TERM)
+caps.limit.draw_vertex_count_bits: 32
+caps.limit.draw_indexed_index_count_bits: 32
+caps.limit.mip_levels: 15
+caps.limit.texture2d_array_size: 2048
+caps.address_space: 3754.3 MB available of 4095.9 MB virtual
+step.caps: done
+step.compile: start
+compiler.load: 2.958 ms
+compiler.path: C:\Windows\SYSTEM32\d3dcompiler_47.dll
+compiler.version: 6.2.26100.9168
+compile.shaders_folder: C:\Users\carlo\Projects\halo-ce-universal\build\windows\..\..\port\windows\probe (6 shaders)
+compile.first_of_process: ps_large.hlsl ps_4_0, 28.326 ms wall, 15.625 ms thread CPU
+compile.ps_large.hlsl.ps_4_0.source_bytes: 9313
+compile.ps_large.hlsl.ps_4_0.bytecode_bytes: 3524
+compile.ps_large.hlsl.ps_4_0.wall: first 28.326 ms, then min 24.314 ms, median 25.551 ms, max 27.251 ms (9 more)
+compile.ps_large.hlsl.ps_4_0.thread_cpu: first 15.625 ms, then min 15.625 ms, median 31.250 ms, max 31.250 ms (9 more)
+compile.ps_large.hlsl.ps_4_0.create_shader: first 0.130 ms, then min 0.058 ms, median 0.074 ms, max 0.110 ms (9 more)
+compile.ps_pass.hlsl.ps_4_0.source_bytes: 302
+compile.ps_pass.hlsl.ps_4_0.bytecode_bytes: 456
+compile.ps_pass.hlsl.ps_4_0.wall: first 1.594 ms, then min 0.959 ms, median 1.013 ms, max 1.341 ms (9 more)
+compile.ps_pass.hlsl.ps_4_0.thread_cpu: first 15.625 ms, then min 0.000 ms, median 0.000 ms, max 0.000 ms (9 more)
+compile.ps_pass.hlsl.ps_4_0.create_shader: first 0.025 ms, then min 0.012 ms, median 0.012 ms, max 0.025 ms (9 more)
+compile.ps_typical.hlsl.ps_4_0.source_bytes: 4495
+compile.ps_typical.hlsl.ps_4_0.bytecode_bytes: 1708
+compile.ps_typical.hlsl.ps_4_0.wall: first 8.923 ms, then min 8.254 ms, median 8.500 ms, max 8.781 ms (9 more)
+compile.ps_typical.hlsl.ps_4_0.thread_cpu: first 15.625 ms, then min 0.000 ms, median 15.625 ms, max 15.625 ms (9 more)
+compile.ps_typical.hlsl.ps_4_0.create_shader: first 0.041 ms, then min 0.026 ms, median 0.032 ms, max 0.045 ms (9 more)
+compile.vs_large.hlsl.vs_4_0.source_bytes: 11757
+compile.vs_large.hlsl.vs_4_0.bytecode_bytes: 4960
+compile.vs_large.hlsl.vs_4_0.wall: first 148.436 ms, then min 145.102 ms, median 146.435 ms, max 148.824 ms (9 more)
+compile.vs_large.hlsl.vs_4_0.thread_cpu: first 140.625 ms, then min 140.625 ms, median 140.625 ms, max 156.250 ms (9 more)
+compile.vs_large.hlsl.vs_4_0.create_shader: first 0.095 ms, then min 0.090 ms, median 0.100 ms, max 0.101 ms (9 more)
+compile.vs_pass.hlsl.vs_4_0.source_bytes: 450
+compile.vs_pass.hlsl.vs_4_0.bytecode_bytes: 528
+compile.vs_pass.hlsl.vs_4_0.wall: first 1.572 ms, then min 0.948 ms, median 0.984 ms, max 1.263 ms (9 more)
+compile.vs_pass.hlsl.vs_4_0.thread_cpu: first 0.000 ms, then min 0.000 ms, median 0.000 ms, max 15.625 ms (9 more)
+compile.vs_pass.hlsl.vs_4_0.create_shader: first 0.027 ms, then min 0.012 ms, median 0.013 ms, max 0.023 ms (9 more)
+compile.vs_typical.hlsl.vs_4_0.source_bytes: 7417
+compile.vs_typical.hlsl.vs_4_0.bytecode_bytes: 2712
+compile.vs_typical.hlsl.vs_4_0.wall: first 24.892 ms, then min 23.831 ms, median 24.311 ms, max 25.351 ms (9 more)
+compile.vs_typical.hlsl.vs_4_0.thread_cpu: first 15.625 ms, then min 15.625 ms, median 31.250 ms, max 31.250 ms (9 more)
+compile.vs_typical.hlsl.vs_4_0.create_shader: first 0.053 ms, then min 0.042 ms, median 0.049 ms, max 0.054 ms (9 more)
+compile.ps_large.hlsl.ps_5_0.source_bytes: 9313
+compile.ps_large.hlsl.ps_5_0.bytecode_bytes: 3912
+compile.ps_large.hlsl.ps_5_0.wall: first 27.001 ms, then min 26.355 ms, median 27.124 ms, max 27.945 ms (9 more)
+compile.ps_large.hlsl.ps_5_0.thread_cpu: first 15.625 ms, then min 15.625 ms, median 31.250 ms, max 31.250 ms (9 more)
+compile.ps_large.hlsl.ps_5_0.create_shader: first 0.061 ms, then min 0.055 ms, median 0.063 ms, max 0.070 ms (9 more)
+compile.ps_pass.hlsl.ps_5_0.source_bytes: 302
+compile.ps_pass.hlsl.ps_5_0.bytecode_bytes: 524
+compile.ps_pass.hlsl.ps_5_0.wall: first 1.441 ms, then min 1.040 ms, median 1.102 ms, max 1.275 ms (9 more)
+compile.ps_pass.hlsl.ps_5_0.thread_cpu: first 0.000 ms, then min 0.000 ms, median 0.000 ms, max 15.625 ms (9 more)
+compile.ps_pass.hlsl.ps_5_0.create_shader: first 0.026 ms, then min 0.012 ms, median 0.013 ms, max 0.020 ms (9 more)
+compile.ps_typical.hlsl.ps_5_0.source_bytes: 4495
+compile.ps_typical.hlsl.ps_5_0.bytecode_bytes: 2072
+compile.ps_typical.hlsl.ps_5_0.wall: first 9.209 ms, then min 8.785 ms, median 9.348 ms, max 9.771 ms (9 more)
+compile.ps_typical.hlsl.ps_5_0.thread_cpu: first 15.625 ms, then min 0.000 ms, median 15.625 ms, max 15.625 ms (9 more)
+compile.ps_typical.hlsl.ps_5_0.create_shader: first 0.035 ms, then min 0.026 ms, median 0.036 ms, max 0.154 ms (9 more)
+compile.vs_large.hlsl.vs_5_0.source_bytes: 11757
+compile.vs_large.hlsl.vs_5_0.bytecode_bytes: 5116
+compile.vs_large.hlsl.vs_5_0.wall: first 170.295 ms, then min 166.604 ms, median 168.716 ms, max 170.789 ms (9 more)
+compile.vs_large.hlsl.vs_5_0.thread_cpu: first 171.875 ms, then min 156.250 ms, median 171.875 ms, max 171.875 ms (9 more)
+compile.vs_large.hlsl.vs_5_0.create_shader: first 0.101 ms, then min 0.095 ms, median 0.100 ms, max 0.110 ms (9 more)
+compile.vs_pass.hlsl.vs_5_0.source_bytes: 450
+compile.vs_pass.hlsl.vs_5_0.bytecode_bytes: 596
+compile.vs_pass.hlsl.vs_5_0.wall: first 1.777 ms, then min 1.069 ms, median 1.164 ms, max 1.469 ms (9 more)
+compile.vs_pass.hlsl.vs_5_0.thread_cpu: first 0.000 ms, then min 0.000 ms, median 0.000 ms, max 15.625 ms (9 more)
+compile.vs_pass.hlsl.vs_5_0.create_shader: first 0.034 ms, then min 0.012 ms, median 0.014 ms, max 0.027 ms (9 more)
+compile.vs_typical.hlsl.vs_5_0.source_bytes: 7417
+compile.vs_typical.hlsl.vs_5_0.bytecode_bytes: 2892
+compile.vs_typical.hlsl.vs_5_0.wall: first 27.556 ms, then min 26.311 ms, median 27.103 ms, max 27.867 ms (9 more)
+compile.vs_typical.hlsl.vs_5_0.thread_cpu: first 31.250 ms, then min 15.625 ms, median 31.250 ms, max 31.250 ms (9 more)
+compile.vs_typical.hlsl.vs_5_0.create_shader: first 0.064 ms, then min 0.047 ms, median 0.055 ms, max 0.071 ms (9 more)
+compile.ps_large.hlsl.ps_4_0_o1.source_bytes: 9313
+compile.ps_large.hlsl.ps_4_0_o1.bytecode_bytes: 3524
+compile.ps_large.hlsl.ps_4_0_o1.wall: first 24.246 ms, then min 23.644 ms, median 24.412 ms, max 25.875 ms (9 more)
+compile.ps_large.hlsl.ps_4_0_o1.thread_cpu: first 15.625 ms, then min 15.625 ms, median 31.250 ms, max 31.250 ms (9 more)
+compile.ps_large.hlsl.ps_4_0_o1.create_shader: first 0.060 ms, then min 0.051 ms, median 0.058 ms, max 0.069 ms (9 more)
+compile.ps_pass.hlsl.ps_4_0_o1.source_bytes: 302
+compile.ps_pass.hlsl.ps_4_0_o1.bytecode_bytes: 456
+compile.ps_pass.hlsl.ps_4_0_o1.wall: first 1.432 ms, then min 0.955 ms, median 0.997 ms, max 1.270 ms (9 more)
+compile.ps_pass.hlsl.ps_4_0_o1.thread_cpu: first 0.000 ms, then min 0.000 ms, median 0.000 ms, max 0.000 ms (9 more)
+compile.ps_pass.hlsl.ps_4_0_o1.create_shader: first 0.020 ms, then min 0.012 ms, median 0.013 ms, max 0.017 ms (9 more)
+compile.ps_typical.hlsl.ps_4_0_o1.source_bytes: 4495
+compile.ps_typical.hlsl.ps_4_0_o1.bytecode_bytes: 1708
+compile.ps_typical.hlsl.ps_4_0_o1.wall: first 8.138 ms, then min 7.816 ms, median 7.888 ms, max 8.324 ms (9 more)
+compile.ps_typical.hlsl.ps_4_0_o1.thread_cpu: first 15.625 ms, then min 0.000 ms, median 0.000 ms, max 15.625 ms (9 more)
+compile.ps_typical.hlsl.ps_4_0_o1.create_shader: first 0.026 ms, then min 0.023 ms, median 0.024 ms, max 0.029 ms (9 more)
+compile.vs_large.hlsl.vs_4_0_o1.source_bytes: 11757
+compile.vs_large.hlsl.vs_4_0_o1.bytecode_bytes: 4960
+compile.vs_large.hlsl.vs_4_0_o1.wall: first 141.337 ms, then min 142.288 ms, median 144.323 ms, max 149.788 ms (9 more)
+compile.vs_large.hlsl.vs_4_0_o1.thread_cpu: first 140.625 ms, then min 140.625 ms, median 140.625 ms, max 156.250 ms (9 more)
+compile.vs_large.hlsl.vs_4_0_o1.create_shader: first 0.082 ms, then min 0.077 ms, median 0.098 ms, max 0.099 ms (9 more)
+compile.vs_pass.hlsl.vs_4_0_o1.source_bytes: 450
+compile.vs_pass.hlsl.vs_4_0_o1.bytecode_bytes: 528
+compile.vs_pass.hlsl.vs_4_0_o1.wall: first 1.544 ms, then min 0.948 ms, median 0.969 ms, max 1.219 ms (9 more)
+compile.vs_pass.hlsl.vs_4_0_o1.thread_cpu: first 0.000 ms, then min 0.000 ms, median 0.000 ms, max 0.000 ms (9 more)
+compile.vs_pass.hlsl.vs_4_0_o1.create_shader: first 0.020 ms, then min 0.010 ms, median 0.010 ms, max 0.018 ms (9 more)
+compile.vs_typical.hlsl.vs_4_0_o1.source_bytes: 7417
+compile.vs_typical.hlsl.vs_4_0_o1.bytecode_bytes: 2712
+compile.vs_typical.hlsl.vs_4_0_o1.wall: first 25.590 ms, then min 25.320 ms, median 25.613 ms, max 26.166 ms (9 more)
+compile.vs_typical.hlsl.vs_4_0_o1.thread_cpu: first 31.250 ms, then min 15.625 ms, median 31.250 ms, max 31.250 ms (9 more)
+compile.vs_typical.hlsl.vs_4_0_o1.create_shader: first 0.070 ms, then min 0.057 ms, median 0.062 ms, max 0.066 ms (9 more)
+compile.ps_large.hlsl.ps_4_0_skip_optimization.source_bytes: 9313
+compile.ps_large.hlsl.ps_4_0_skip_optimization.bytecode_bytes: 6808
+compile.ps_large.hlsl.ps_4_0_skip_optimization.wall: first 14.322 ms, then min 12.059 ms, median 12.818 ms, max 13.375 ms (9 more)
+compile.ps_large.hlsl.ps_4_0_skip_optimization.thread_cpu: first 15.625 ms, then min 0.000 ms, median 15.625 ms, max 15.625 ms (9 more)
+compile.ps_large.hlsl.ps_4_0_skip_optimization.create_shader: first 0.100 ms, then min 0.080 ms, median 0.091 ms, max 0.099 ms (9 more)
+compile.ps_pass.hlsl.ps_4_0_skip_optimization.source_bytes: 302
+compile.ps_pass.hlsl.ps_4_0_skip_optimization.bytecode_bytes: 456
+compile.ps_pass.hlsl.ps_4_0_skip_optimization.wall: first 1.461 ms, then min 0.861 ms, median 0.943 ms, max 1.155 ms (9 more)
+compile.ps_pass.hlsl.ps_4_0_skip_optimization.thread_cpu: first 0.000 ms, then min 0.000 ms, median 0.000 ms, max 0.000 ms (9 more)
+compile.ps_pass.hlsl.ps_4_0_skip_optimization.create_shader: first 0.019 ms, then min 0.009 ms, median 0.010 ms, max 0.016 ms (9 more)
+compile.ps_typical.hlsl.ps_4_0_skip_optimization.source_bytes: 4495
+compile.ps_typical.hlsl.ps_4_0_skip_optimization.bytecode_bytes: 2820
+compile.ps_typical.hlsl.ps_4_0_skip_optimization.wall: first 5.650 ms, then min 5.004 ms, median 5.101 ms, max 5.234 ms (9 more)
+compile.ps_typical.hlsl.ps_4_0_skip_optimization.thread_cpu: first 0.000 ms, then min 0.000 ms, median 0.000 ms, max 15.625 ms (9 more)
+compile.ps_typical.hlsl.ps_4_0_skip_optimization.create_shader: first 0.033 ms, then min 0.032 ms, median 0.034 ms, max 0.036 ms (9 more)
+compile.vs_large.hlsl.vs_4_0_skip_optimization.source_bytes: 11757
+compile.vs_large.hlsl.vs_4_0_skip_optimization.bytecode_bytes: 10588
+compile.vs_large.hlsl.vs_4_0_skip_optimization.wall: first 50.243 ms, then min 46.801 ms, median 48.019 ms, max 50.037 ms (9 more)
+compile.vs_large.hlsl.vs_4_0_skip_optimization.thread_cpu: first 46.875 ms, then min 46.875 ms, median 46.875 ms, max 62.500 ms (9 more)
+compile.vs_large.hlsl.vs_4_0_skip_optimization.create_shader: first 0.135 ms, then min 0.136 ms, median 0.145 ms, max 0.169 ms (9 more)
+compile.vs_pass.hlsl.vs_4_0_skip_optimization.source_bytes: 450
+compile.vs_pass.hlsl.vs_4_0_skip_optimization.bytecode_bytes: 576
+compile.vs_pass.hlsl.vs_4_0_skip_optimization.wall: first 1.622 ms, then min 0.949 ms, median 1.040 ms, max 1.219 ms (9 more)
+compile.vs_pass.hlsl.vs_4_0_skip_optimization.thread_cpu: first 0.000 ms, then min 0.000 ms, median 0.000 ms, max 15.625 ms (9 more)
+compile.vs_pass.hlsl.vs_4_0_skip_optimization.create_shader: first 0.035 ms, then min 0.011 ms, median 0.015 ms, max 0.023 ms (9 more)
+compile.vs_typical.hlsl.vs_4_0_skip_optimization.source_bytes: 7417
+compile.vs_typical.hlsl.vs_4_0_skip_optimization.bytecode_bytes: 5344
+compile.vs_typical.hlsl.vs_4_0_skip_optimization.wall: first 15.006 ms, then min 13.161 ms, median 13.674 ms, max 15.951 ms (9 more)
+compile.vs_typical.hlsl.vs_4_0_skip_optimization.thread_cpu: first 15.625 ms, then min 0.000 ms, median 15.625 ms, max 15.625 ms (9 more)
+compile.vs_typical.hlsl.vs_4_0_skip_optimization.create_shader: first 0.087 ms, then min 0.069 ms, median 0.077 ms, max 0.100 ms (9 more)
+compile.precise.output_member.vs_4_0: compiles (728 bytes)
+compile.precise.output_member.vs_5_0: compiles (840 bytes)
+compile.precise.local_variable.vs_4_0: compiles (728 bytes)
+compile.precise.local_variable.vs_5_0: compiles (840 bytes)
+compile.precise.ieee_strictness.vs_4_0: compiles (728 bytes)
+compile.precise.ieee_strictness.vs_5_0: compiles (840 bytes)
+step.compile: done
+step.memory: start
+memory.address_space.start: 3745.5 MB available of 4095.9 MB virtual
+memory.ring.wall: 145.4 ms for 300 frames of 4096 KB in 64 pieces (38 discards)
+memory.ring.cpu_per_frame: min 0.289 ms, median 0.327 ms, p99 0.511 ms, max 3.354 ms (300)
+memory.ring.gpu_per_frame: min 0.040 ms, median 0.040 ms, p99 0.045 ms, max 0.050 ms (300)
+memory.ring.map_copy_unmap_per_piece: min 0.004 ms, median 0.005 ms, p99 0.007 ms, max 2.933 ms (19200)
+memory.address_space.after_ring: 3677.5 MB available of 4095.9 MB virtual
+memory.mirror_update_1024.wall: 1356.3 ms for 300 frames of 1024 pages
+memory.mirror_update_1024.cpu_per_frame: min 3.784 ms, median 3.992 ms, p99 4.471 ms, max 4.688 ms (300)
+memory.mirror_update_1024.gpu_per_frame: min 0.150 ms, median 0.152 ms, p99 0.594 ms, max 0.606 ms (300)
+memory.mirror_update_64.wall: 106.4 ms for 300 frames of 64 pages
+memory.mirror_update_64.cpu_per_frame: min 0.235 ms, median 0.250 ms, p99 0.444 ms, max 0.476 ms (300)
+memory.mirror_update_64.gpu_per_frame: min 0.010 ms, median 0.010 ms, p99 0.013 ms, max 0.034 ms (300)
+memory.mirror_staging_1024.wall: 731.8 ms for 300 frames of 1024 pages
+memory.mirror_staging_1024.cpu_per_frame: min 1.578 ms, median 1.672 ms, p99 1.943 ms, max 2.092 ms (300)
+memory.mirror_staging_1024.gpu_per_frame: min 0.150 ms, median 0.150 ms, p99 0.175 ms, max 0.175 ms (300)
+memory.mirror_staging_64.wall: 55.7 ms for 300 frames of 64 pages
+memory.mirror_staging_64.cpu_per_frame: min 0.103 ms, median 0.108 ms, p99 0.183 ms, max 0.231 ms (300)
+memory.mirror_staging_64.gpu_per_frame: min 0.010 ms, median 0.010 ms, p99 0.010 ms, max 0.013 ms (300)
+memory.address_space.after_mirror: 3677.5 MB available of 4095.9 MB virtual
+memory.rewrite.ring_no_overwrite_append: first 0xff0000ff (red), second 0xff00ff00 (green): ok
+memory.rewrite.ring_discard: first 0xff0000ff (red), second 0xff00ff00 (green): ok
+memory.rewrite.mirror_update_subresource: first 0xff0000ff (red), second 0xff00ff00 (green): ok
+memory.rewrite.mirror_staging_copy: first 0xff0000ff (red), second 0xff00ff00 (green): ok
+memory.texture.bc1_512.per_upload: first 0.384 ms, then min 0.021 ms, median 0.048 ms, max 0.595 ms (299 more)
+memory.texture.bc1_512.all_done: 21.1 ms for 300 uploads of 128.0 KB, the GPU done
+memory.texture.bgra8_512.per_upload: first 0.110 ms, then min 0.032 ms, median 0.378 ms, max 5.953 ms (299 more)
+memory.texture.bgra8_512.all_done: 164.3 ms for 300 uploads of 1024.0 KB, the GPU done
+memory.texture.bgra8_2048.per_upload: 0.990 ms
+memory.texture.bgra8_2048.all_done: 7.4 ms for 1 uploads of 16384.0 KB, the GPU done
+memory.address_space.after_textures: 3485.5 MB available of 4095.9 MB virtual
+memory.address_space.before_buffers: 3481.5 MB available of 4095.9 MB virtual
+memory.address_space.buffers_alive: 64 MB
+memory.address_space.with_64mb_buffers: 3481.5 MB available of 4095.9 MB virtual
+memory.address_space.used_since_before_device: 368.2 MB
+memory.address_space.after_release: 3481.5 MB available of 4095.9 MB virtual
+step.memory: done
+step.queries: start
+queries.no_flush.answered: 64 of 64 within 3 frames of 16.7 ms
+queries.no_flush.frames_to_answer: min 2, median 2, max 2
+queries.no_flush.ms_to_answer: min 33.5, median 33.5, max 33.5
+queries.no_flush.exact: 64 of 64 answered are exactly n*n
+queries.flush.answered: 64 of 64 within 1 frames of 16.7 ms
+queries.flush.frames_to_answer: min 0, median 0, max 0
+queries.flush.ms_to_answer: min 0.6, median 0.7, max 0.7
+queries.flush.exact: 64 of 64 answered are exactly n*n
+queries.predicate.0x0: not visible (0x00000000 S_OK)
+queries.predicate.1x1: visible (0x00000000 S_OK)
+queries.predicate.16x16: visible (0x00000000 S_OK)
+queries.many: 4096 of 4096 made in 119.452 ms
+queries.many.release: 10.228 ms
+step.queries: done
+step.present: start
+present.sdl_version: 3.4.16
+present.sdl_video_driver: windows
+present.hwnd: 00270CA6
+present.display.start: 2880x1620 at 120.00 Hz (pixel density 1.00)
+present.allow_tearing: yes (0x00000000 S_OK)
+present.swap_chain: 0x00000000 S_OK in 5.102 ms (FLIP_DISCARD, 2 buffers, B8G8R8A8_UNORM, SCALING_NONE, 960x720, ALLOW_TEARING)
+present.make_window_association: 0x00000000 S_OK
+present.triangle_compile: 0x00000000 S_OK in 4.897 ms
+present.audio: no tone (--quiet)
+present.sync_interval: 1
+present.script: watch the colour cycle, with a white triangle pointing up at the top left; resize the window by its edge; F11 borderless, F10 exclusive, Escape windowed; F9 cycles three window sizes; minimise and restore; Alt+Enter (nothing should happen); A or Enter if the picture looks right, Y or Backspace if not; B or Escape twice to end. 120 s without input ends the step.
+present.event: pixel size changed to 960x720 at 10018976 ms
+present.result_first_seen: 0x00000000 S_OK at present 1 (10018977 ms)
+present.pacing: 1145 intervals, min 0.083 ms, median 8.332 ms (120.0 Hz), max 332.374 ms, 21 over 1.5x the median
+present.event: pixel size changed to 1628x1174 at 10031691 ms
+present.resize: 960x720 to 1628x1174, ResizeBuffers 0x00000000 S_OK in 1.988 ms
+present.key: F9
+present.transition.window_size: asked at 10038602 ms
+present.transition.window_size: presenting (S_OK) 5.0 ms after it was asked, no resize
+present.event: pixel size changed to 960x720 at 10038607 ms
+present.resize: 1628x1174 to 960x720, ResizeBuffers 0x00000000 S_OK in 0.863 ms
+present.pacing: 1194 intervals, min 6.889 ms, median 8.330 ms (120.0 Hz), max 24.854 ms, 5 over 1.5x the median
+present.key: F9
+present.transition.window_size: asked at 10041966 ms
+present.transition.window_size: presenting (S_OK) 7.2 ms after it was asked, no resize
+present.event: pixel size changed to 1280x720 at 10041974 ms
+present.resize: 960x720 to 1280x720, ResizeBuffers 0x00000000 S_OK in 0.963 ms
+present.key: F11
+present.transition.borderless: asked at 10045309 ms
+present.transition.borderless: presenting (S_OK) 6.0 ms after it was asked, no resize
+present.event: entered fullscreen at 10045316 ms
+present.display.fullscreen: 2880x1620 at 120.00 Hz (pixel density 1.00)
+present.event: pixel size changed to 2880x1620 at 10045316 ms
+present.resize: 1280x720 to 2880x1620, ResizeBuffers 0x00000000 S_OK in 1.314 ms
+present.pacing: 1198 intervals, min 6.389 ms, median 8.326 ms (120.1 Hz), max 17.008 ms, 3 over 1.5x the median
+present.key: Escape
+present.transition.windowed: asked at 10050725 ms
+present.transition.windowed: presenting (S_OK) 25.0 ms after it was asked, no resize
+present.event: left fullscreen at 10050752 ms
+present.event: pixel size changed to 1280x720 at 10050752 ms
+present.resize: 2880x1620 to 1280x720, ResizeBuffers 0x00000000 S_OK in 0.913 ms
+present.key: M
+present.key: I
+present.key: S
+present.key: M
+present.key: O
+present.key: Return
+present.tester: the picture looks right
+present.key: F10
+present.transition.exclusive: asked at 10055148 ms
+present.transition.exclusive: presenting (S_OK) 106.6 ms after it was asked, no resize
+present.event: entered fullscreen at 10055261 ms
+present.display.fullscreen: 2880x1620 at 120.00 Hz (pixel density 1.00)
+present.event: pixel size changed to 2880x1620 at 10055262 ms
+present.resize: 1280x720 to 2880x1620, ResizeBuffers 0x00000000 S_OK in 1.742 ms
+present.key: Left Windows
+present.transition.minimised: asked at 10056147 ms
+present.transition.minimised: presenting (S_OK) 1.3 ms after it was asked, no resize
+present.transition.restored: asked at 10056422 ms
+present.transition.restored: presenting (S_OK) 1.8 ms after it was asked, no resize
+present.key: Alt+Left Alt
+present.transition.minimised: asked at 10056892 ms
+present.transition.minimised: presenting (S_OK) 0.8 ms after it was asked, no resize
+present.pacing: 1159 intervals, min 0.118 ms, median 8.327 ms (120.1 Hz), max 106.879 ms, 26 over 1.5x the median
+present.key: Escape
+present.transition.windowed: asked at 10060607 ms
+present.transition.windowed: presenting (S_OK) 7.8 ms after it was asked, no resize
+present.event: left fullscreen at 10060616 ms
+present.transition.restored: asked at 10068825 ms
+present.event: pixel size changed to 2858x1564 at 10068826 ms
+present.resize: 2880x1620 to 2858x1564, ResizeBuffers 0x00000000 S_OK in 1.236 ms
+present.transition.restored: presenting (S_OK) 6.0 ms after it was asked, after a resize
+present.pacing: 1182 intervals, min 7.052 ms, median 8.329 ms (120.1 Hz), max 23.622 ms, 17 over 1.5x the median
+present.key: Alt+Left Alt
+present.key: Alt+Return
+present.transition.alt_enter: asked at 10073333 ms
+present.transition.alt_enter: presenting (S_OK) 7.5 ms after it was asked, no resize
+present.pacing: 1200 intervals, min 6.444 ms, median 8.329 ms (120.1 Hz), max 16.603 ms, 1 over 1.5x the median
+present.key: Alt+Left Alt
+present.pacing: 1200 intervals, min 7.281 ms, median 8.332 ms (120.0 Hz), max 28.633 ms, 2 over 1.5x the median
+present.key: Escape
+present.transition.windowed: asked at 10089857 ms
+present.transition.windowed: presenting (S_OK) 7.5 ms after it was asked, no resize
+present.pacing: 1200 intervals, min 5.127 ms, median 8.328 ms (120.1 Hz), max 16.719 ms, 1 over 1.5x the median
+present.pacing: 1195 intervals, min 0.176 ms, median 8.331 ms (120.0 Hz), max 62.494 ms, 6 over 1.5x the median
+present.pacing: 1193 intervals, min 6.504 ms, median 8.330 ms (120.0 Hz), max 23.358 ms, 7 over 1.5x the median
+present.pacing: 1201 intervals, min 6.007 ms, median 8.332 ms (120.0 Hz), max 10.765 ms, 0 over 1.5x the median
+present.pacing: 1182 intervals, min 5.729 ms, median 8.331 ms (120.0 Hz), max 27.223 ms, 16 over 1.5x the median
+present.pacing: 1196 intervals, min 4.351 ms, median 8.328 ms (120.1 Hz), max 25.271 ms, 4 over 1.5x the median
+present.pacing: 1201 intervals, min 4.608 ms, median 8.331 ms (120.0 Hz), max 12.086 ms, 0 over 1.5x the median
+present.pacing: 1201 intervals, min 5.332 ms, median 8.330 ms (120.0 Hz), max 11.394 ms, 0 over 1.5x the median
+present.pacing: 1186 intervals, min 3.798 ms, median 8.333 ms (120.0 Hz), max 22.623 ms, 15 over 1.5x the median
+present.pacing: 1198 intervals, min 0.117 ms, median 8.327 ms (120.1 Hz), max 35.502 ms, 7 over 1.5x the median
+present.pacing: 1201 intervals, min 7.112 ms, median 8.327 ms (120.1 Hz), max 10.257 ms, 0 over 1.5x the median
+present.pacing: 1199 intervals, min 4.216 ms, median 8.331 ms (120.0 Hz), max 17.103 ms, 2 over 1.5x the median
+present.end: 120 s without input
+present.pacing: 87 intervals, min 7.239 ms, median 8.339 ms (119.9 Hz), max 9.435 ms, 0 over 1.5x the median (the last, partial window)
+present.presents: 22719 in 190.9 s
+present.result: 0x00000000 S_OK 22719 times
+present.input: 18 keys, 0 gamepad buttons (no gamepad opened)
+present.tester_answers: 1 right, 0 not right
+step.present: done
+debug.summary: 0 messages, 0 errors or corruption, 0 warnings (no debug layer)
+probe.done: yes
+probe.exit: 0
