@@ -4,7 +4,8 @@ build's debug.txt or halo.log (port/windows/src/win32_crash.c):
 
     python tools/symbolize_crash.py debug.txt path/to/halo.exe
 
-halo.exe must be the build that crashed, with its halo.pdb beside it (a
+halo.exe must be the build that crashed (or halo_d3d11.exe, the Direct3D 11
+executable, if the crash line names it), with its PDB beside it (a
 release's halo-windows-<config>-symbols.zip has the PDB; the zip of the
 same name without -symbols has halo.exe). The lines come from
 llvm-symbolizer, which reads the PDB. The crash reports that reach Sentry
@@ -20,7 +21,8 @@ import sys
 from pathlib import Path
 
 # the crash lines with an address in them (win32_crash.c's crash_filter)
-BASE = re.compile(r"crash: halo\.exe at (?:0x)?([0-9A-Fa-f]+)")
+# (the first names the executable: halo.exe, or halo_d3d11.exe)
+BASE = re.compile(r"crash: \S*\.exe at (?:0x)?([0-9A-Fa-f]+)")
 EXCEPTION = re.compile(r"crash: exception \w+ at (?:0x)?([0-9A-Fa-f]+)")
 CALLER = re.compile(r"crash: called from (?:0x)?([0-9A-Fa-f]+)")
 
@@ -50,7 +52,8 @@ def symbolize(symbolizer: str, executable: Path, addresses: list) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("log", type=Path, help="debug.txt or halo.log")
-    parser.add_argument("executable", type=Path, help="the halo.exe that crashed (halo.pdb beside it)")
+    parser.add_argument("executable", type=Path,
+                        help="the halo.exe (or halo_d3d11.exe) that crashed, its PDB beside it")
     args = parser.parse_args()
 
     symbolizer = shutil.which("llvm-symbolizer") or shutil.which("llvm-addr2line")
@@ -61,8 +64,9 @@ def main() -> int:
     linked, size = image_layout(args.executable)
 
     lines = args.log.read_text(encoding="utf-8", errors="replace").splitlines()
-    # each crash's addresses, relative to where halo.exe was in that run (a
-    # line before "halo.exe at" is from a build too old to say: linked base);
+    # each crash's addresses, relative to where the executable was in that run
+    # (a line before "<executable>.exe at" is from a build too old to say:
+    # linked base);
     # a caller's is its return address, one past the call
     base = linked
     wanted = {}

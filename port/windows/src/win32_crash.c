@@ -803,6 +803,25 @@ static void crash_line(const char *format, ...)
 	write_to_error_file(line, 1);
 }
 
+/* the running executable's file name, which the crash line names: halo.exe,
+or halo_d3d11.exe (port/windows/D3D11.md) */
+static void crash_executable_name(char *name, size_t size)
+{
+	wchar_t path[PATH_SIZE];
+	DWORD length = GetModuleFileNameW(NULL, path, PATH_SIZE);
+	const wchar_t *base;
+
+	if (!length || length >= PATH_SIZE)
+	{
+		snprintf(name, size, "halo.exe");
+		return;
+	}
+	base = wcsrchr(path, L'\\');
+	base = base ? base + 1 : path;
+	if (!WideCharToMultiByte(CP_UTF8, 0, base, -1, name, (int)size, NULL, NULL))
+		snprintf(name, size, "halo.exe");
+}
+
 static LONG WINAPI crash_filter(EXCEPTION_POINTERS *exception)
 {
 	static volatile LONG crashed_thread = 0;
@@ -811,6 +830,7 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *exception)
 	const DWORD *stack = (const DWORD *)context->Esp;
 	LONG thread = (LONG)GetCurrentThreadId();
 	LONG first = InterlockedCompareExchange(&crashed_thread, thread, 0);
+	char executable[MAX_PATH];
 	int dumped;
 
 	/* one report: a crash in this report goes on to Windows, and another
@@ -821,9 +841,10 @@ static LONG WINAPI crash_filter(EXCEPTION_POINTERS *exception)
 		Sleep(INFINITE);
 	/* the minidump first, before anything here can fail */
 	dumped = crash_reports_enabled() && crash_dump(exception);
-	/* (where halo.exe is: tools/symbolize_crash.py finds the lines of the
-	addresses below from it and halo.pdb) */
-	crash_line("crash: halo.exe at %p, build %d (%s)", (void *)GetModuleHandleW(NULL), HALO_BUILD_NUMBER,
+	/* (where the executable is, by its own name: tools/symbolize_crash.py
+	finds the lines of the addresses below from it and its PDB) */
+	crash_executable_name(executable, sizeof(executable));
+	crash_line("crash: %s at %p, build %d (%s)", executable, (void *)GetModuleHandleW(NULL), HALO_BUILD_NUMBER,
 		HALO_BUILD_FLAVOR);
 	crash_line("crash: exception %08lx at %p (accessing %p), eip %08lx ebp %08lx esp %08lx",
 		record->ExceptionCode, record->ExceptionAddress,
