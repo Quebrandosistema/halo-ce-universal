@@ -134,6 +134,13 @@ static const struct config_setting config_settings[] =
 		"next time the game starts. See the Android README, \"Graphics: OpenGL ES and\n"
 		"Vulkan\"." },
 #endif
+#ifdef _WIN32
+	/* read by the Direct3D 11 executable's renderer (port/windows/D3D11.md;
+	port/windows/d3d11/win32_d3d11.c) */
+	{ "display.d3d11_adapter", _config_string, "\"\"", "HALO_D3D11_ADAPTER", _environment_value, _platform_windows,
+		"Direct3D 11 executable: empty for the fastest GPU, \"warp\" for Microsoft's\n"
+		"software renderer, or part of an adapter's name." },
+#endif
 	{ "display.vsync", _config_boolean, "true", "HALO_NO_VSYNC", _environment_set_is_false, _platform_all,
 		"Wait for the display between frames; false draws as fast as possible." },
 	{ "display.max_fps", _config_integer, "0", "HALO_MAX_FPS", _environment_value, _platform_desktop,
@@ -591,6 +598,11 @@ static const struct config_setting config_settings[] =
 		"Run without a window, drawing nothing." },
 	{ "debug.gl_debug", _config_boolean, "false", "HALO_GL_DEBUG", _environment_set_is_true, _platform_all,
 		"Report OpenGL errors in the log." },
+#ifdef _WIN32
+	{ "debug.d3d11_debug", _config_boolean, "false", "HALO_D3D11_DEBUG", _environment_set_is_true, _platform_windows,
+		"Direct3D 11 executable: the Direct3D debug layer's messages in the log\n"
+		"(needs the Graphics Tools feature of Windows)." },
+#endif
 	{ "debug.menu_open", _config_string, "\"\"", "HALO_MENU_OPEN", _environment_value, _platform_all,
 		"Start on this screen of the menus (port/assets/menus) instead of the main\n"
 		"menu, a player profile being edited; empty for the main menu." },

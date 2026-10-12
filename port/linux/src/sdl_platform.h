@@ -75,6 +75,16 @@ struct platform_keystroke
 BOOL platform_sdl_initialize(void);
 /* creates the window and makes its OpenGL context current on this thread */
 BOOL platform_video_initialize(unsigned long width, unsigned long height);
+#ifdef _WIN32
+/* (the Direct3D 11 executable's device, port/windows/d3d11/d3d8_d3d11.c,
+before platform_video_initialize) the window without an OpenGL context: no
+context, no GL entry points, no swap; platform_video_swap only paces, with
+display.vsync at the display's refresh rate */
+void platform_video_without_gl(void);
+/* the window's HWND (the Direct3D 11 renderer's swap chain), or NULL
+without a window */
+void *platform_video_native_window(void);
+#endif
 #ifndef HALO_ANDROID
 BOOL platform_screen_mode(long *width, long *height);
 #endif
