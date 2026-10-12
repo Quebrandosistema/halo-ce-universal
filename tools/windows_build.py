@@ -146,7 +146,8 @@ def _load_config() -> Dict[str, Any]:
 
 def windows_configure_inputs() -> List[Path]:
     """Files whose change must re-run configure.py."""
-    return [Path(__file__), PORT_CONFIG, PORT_DIR / "src", LINUX_DIR / "src", LINUX_DIR / "game", *hud_configure_inputs()]
+    return [Path(__file__), PORT_CONFIG, PORT_DIR / "src", PORT_DIR / "d3d11", LINUX_DIR / "src", LINUX_DIR / "game",
+            *hud_configure_inputs()]
 
 
 def _quote(path: Any) -> str:
@@ -315,6 +316,11 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
     resources = BUILD / "halo.res"
     n.build(outputs=resources, rule="windows_rc", inputs=PORT_DIR / "halo.rc", implicit=[PORT_DIR / "opence-icon.ico"])
     n.rule(
+        name="windows_gl_stubs",
+        command="$python tools/windows_gl_stubs.py $in $out",
+        description="WINDOWS GL STUBS $out",
+    )
+    n.rule(
         name="windows_copy",
         command="$python -c \"import shutil,sys; shutil.copyfile(sys.argv[1], sys.argv[2])\" $in $out",
         description="WINDOWS COPY $out",
@@ -351,10 +357,14 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
         base_ldflags += ["-Wl,/SUBSYSTEM:CONSOLE"]
 
     def emit(obj_dir: Path, output: Path, extra_cflags: List[str], extra_ldflags: List[str],
-             extra_objects: List[Path], implicit_inputs: List[Path]) -> None:
-        """the objects and the executable, with the given extra flags"""
+             extra_objects: List[Path], implicit_inputs: List[Path], d3d11_output: Optional[Path] = None) -> List[Path]:
+        """the objects and the executable, with the given extra flags; with
+        d3d11_output, also the Direct3D 11 executable (port/windows/D3D11.md)
+        from the same objects but the OpenGL renderer's. Returns the objects."""
         extra = " ".join(extra_cflags)
         objects: List[Path] = []
+        # the OpenGL renderer's objects, which the Direct3D 11 executable leaves out
+        gl_objects: List[Path] = []
 
         def add_object(source: Path, cflags: str) -> None:
             obj = obj_dir / source.with_suffix(".o")
@@ -440,6 +450,9 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
                 add_object(source, f"{platform_cflags} {updater_defines(getattr(sln, 'port_release', False))}")
             else:
                 add_object(source, platform_cflags)
+            # (the device, display.anti_aliasing's passes and the GL entry points)
+            if source.name in ("d3d8_gl.c", "xgpu_post.c", "gl_functions.c"):
+                gl_objects.append(objects[-1])
         miniupnpc_include = f"-I{MINIUPNPC_DIR / 'include'} -DMINIUPNP_STATICLIB"
         for source in sorted((PORT_DIR / "src").glob("*.c")):
             if source.name == "win32_upnp.c":
@@ -491,6 +504,41 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
             inputs=objects + extra_objects + [resources],
             variables={"ldflags": " ".join(base_ldflags + extra_ldflags), "libs": libs},
         )
+        if d3d11_output is None:
+            return objects
+
+        # The Direct3D 11 executable (port/windows/D3D11.md): the same objects
+        # with the OpenGL renderer's replaced by port/windows/d3d11's units
+        # (win32_* against the Windows SDK, the rest against the Xbox SDK, as
+        # port/windows/src's), and the GL entry points the shared files still
+        # call by counted stubs generated from gl.h's list (build/windows/gl_stubs.c)
+        if len(gl_objects) != 3:
+            sys.exit(f"the OpenGL renderer's objects were not all found: {gl_objects}")
+        d3d11_objects = [obj for obj in objects if obj not in gl_objects]
+        for source in sorted((PORT_DIR / "d3d11").glob("*.c")):
+            # (phase 0's probe has its target of its own, below)
+            if source.name == "win32_d3d11_probe.c":
+                continue
+            add_object(source, win32_cflags if source.name.startswith("win32_") else platform_cflags)
+            d3d11_objects.append(objects.pop())
+        gl_stubs = BUILD / "gl_stubs.c"
+        sdl_gl_headers = [sdl_include / "SDL3" / "SDL_opengl.h", sdl_include / "SDL3" / "SDL_opengl_glext.h"]
+        n.build(
+            outputs=gl_stubs,
+            rule="windows_gl_stubs",
+            inputs=[linux_platform / "gl.h", *sdl_gl_headers],
+            implicit=[Path("tools/windows_gl_stubs.py")],
+        )
+        add_object(gl_stubs, platform_cflags)
+        d3d11_objects.append(objects.pop())
+        n.build(
+            outputs=d3d11_output,
+            rule="windows_link",
+            inputs=d3d11_objects + extra_objects,
+            variables={"ldflags": " ".join(base_ldflags + extra_ldflags),
+                       "libs": " ".join([libs, "-ld3d11", "-ldxgi", "-ldxguid"])},
+        )
+        return objects
 
     # Profile-guided optimisation: with the committed Windows profile (or
     # the Linux one, which matches most of the game), or with --pgo=train
@@ -543,13 +591,17 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
     # link-time optimisation (configure.py --lto)
     lto = lto_mode(sln)
     lto_cflags = [] if lto == "off" else ["-flto=thin" if lto == "thin" else "-flto=full"]
+    # (and the Direct3D 11 executable, port/windows/D3D11.md, but while a
+    # profile is trained: the training runs halo.exe; with a profile, its own
+    # units have none, which is harmless)
+    d3d11_output = None if pgo_mode(sln) == "train" else BUILD / "halo_d3d11.exe"
     emit(obj_dir, output, lto_cflags + profile_use_flags(profile),
-         lto_cflags + [OPTIMISATION] if lto_cflags else [], [], [profile] if profile else [])
+         lto_cflags + [OPTIMISATION] if lto_cflags else [], [], [profile] if profile else [], d3d11_output)
     n.build(outputs=sdl_dll, rule="windows_copy", inputs=SDL_DIR / "lib" / "x86" / "SDL3.dll")
     # internet play's MQTT brokers, a file beside the game (network.brokers_file)
     brokers = BUILD / "brokers.txt"
     n.build(outputs=brokers, rule="windows_copy", inputs=Path("port/assets/network/brokers.txt"))
-    n.build(outputs="windows", rule="phony", inputs=[output, sdl_dll, brokers])
+    n.build(outputs="windows", rule="phony", inputs=[output, sdl_dll, brokers, *([d3d11_output] if d3d11_output else [])])
 
     # the Direct3D 11 probe (port/windows/D3D11.md, phase 0): one Windows-facing
     # unit, a console program; not part of `windows`
