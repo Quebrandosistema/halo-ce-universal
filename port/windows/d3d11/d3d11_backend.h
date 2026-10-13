@@ -4,14 +4,15 @@ D3D11_BACKEND.H
 The boundary between the Direct3D 11 renderer's two halves
 (port/windows/D3D11.md, "Where the renderer lives"): the Direct3D 8 device
 the game drives (d3d8_d3d11.c, compiled against the Xbox SDK's headers) and
-the Direct3D 11 backend (win32_d3d11.c and win32_d3d11_present.c, against the
-Windows SDK's). The two SDKs define the same names differently, so no unit
+the Direct3D 11 backend (win32_d3d11.c, win32_d3d11_present.c and
+win32_d3d11_memory.c, against the Windows SDK's). The two SDKs define the same names differently, so no unit
 sees both: this header includes neither, and only fixed-width integers, int,
 strings and plain pointers cross it, as in update.h and posix.h.
 
 Phase 1: the device, the adapter, the debug layer, the log line. Phase 2: the
 swap chain and the present, the render targets, the clears, the read-back,
-the clears' self-test, the lost device.
+the clears' self-test, the lost device. Phase 3: the stream and index rings,
+the mirror's segments and their upload ring, the memory self-test.
 */
 
 #ifndef D3D11_BACKEND_H
@@ -104,5 +105,60 @@ int d3d11_backend_self_test(char *line, size_t line_size);
 d3d11_backend_lost_reason's words); from then on the backend does nothing */
 int d3d11_backend_lost(void);
 const char *d3d11_backend_lost_reason(void);
+
+/* ---------- the game's memory (win32_d3d11_memory.c)
+
+Everything the device hands these is copied during the call: nothing of the
+game's memory is read later. */
+
+/* the stream ring (stream_size bytes, vertices), the index ring (index_size
+bytes, 16-bit indices), both D3D11_USAGE_DYNAMIC, and the mirror's upload
+ring. 1 with all three; 0 without, after which every call below answers 0.
+line holds the log line either way ("d3d11: buffers: ..." with the address
+space left, or "d3d11: no buffers (...)"), which the caller logs. Called
+once. */
+int d3d11_backend_memory_initialize(uint32_t stream_size, uint32_t index_size, char *line, size_t line_size);
+
+/* the two rings */
+#define D3D11_BACKEND_RING_STREAM 0u
+#define D3D11_BACKEND_RING_INDEX 1u
+
+/* the next write to the ring maps it with D3D11_MAP_WRITE_DISCARD: the
+ring's earlier bytes stay what earlier draws read, and the caller writes from
+0 again */
+void d3d11_backend_ring_orphan(uint32_t ring);
+
+/* size bytes of data into the ring at offset: a no-overwrite map, the
+caller's promise that no bytes written since the last orphan are written
+again (the first write after an orphan, or the ring's first, discards). 1 on
+success; 0 for a range past the ring's end (logged once), a map that failed
+(logged once; a lost device through d3d11_backend_lost) or no buffers. */
+int d3d11_backend_ring_write(uint32_t ring, uint32_t offset, const void *data, uint32_t size);
+
+/* the D3D11_MAP_WRITE_DISCARD maps of the two rings since the start */
+uint32_t d3d11_backend_ring_discards(void);
+
+/* a segment of the mirror: a DEFAULT buffer of size bytes for vertices and
+indices, its contents undefined until written. Its handle, from 1; 0 if it
+could not be made (logged). Never freed. */
+uint32_t d3d11_backend_segment_create(uint32_t size);
+
+/* how many segments exist */
+uint32_t d3d11_backend_segments_alive(void);
+
+/* size bytes of data into the segment at offset, through the upload ring and
+a copy queued in the context, in order with the draws: a draw after the call
+reads these bytes, one before it what the segment held. 1 on success; 0 for
+a range outside the segment or larger than the upload ring (logged once), a
+failure (logged once; a lost device through d3d11_backend_lost) or no
+buffers. */
+int d3d11_backend_segment_write(uint32_t segment, uint32_t offset, const void *data, uint32_t size);
+
+/* debug.d3d11_self_test's second test: bytes in ordinary memory written
+through the stream ring (appended, and across an orphan), a segment (the same
+bytes rewritten in place) and the index ring, each drawn into a target of
+the test's own after each write and read back. 1 if every draw had the colour
+its bytes had at the draw; line says so, or which case and draw differed. */
+int d3d11_backend_memory_self_test(char *line, size_t line_size);
 
 #endif

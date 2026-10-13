@@ -23,7 +23,21 @@ Phase 2 brought back, with the backend's calls in place of the GL, d3d8_gl.c's
 render target table (render_target_get, bind_targets), Clear's arithmetic,
 the screenshot writer and the letterboxed present (the backend draws it),
 and the menus' pointer as d3d8_gl.c has it: the game's clears are on the
-screen. Its draws are still counted and dropped. The answers the game reads
+screen.
+
+Phase 3 brought back d3d8_gl.c's memory paths, with the backend's calls in
+place of the GL (port/windows/d3d11/win32_d3d11_memory.c): the stream and
+index rings' bookkeeping (stream_reserve, stream_upload, index_upload), the
+mirror of the contiguous window with its pages, generations and volatile
+rule (mirror_refresh, mirror_range) and the index extent cache; and, of the
+draws, their data work: setup_streams' upload half as stream_data, the
+indexed draw's mirror lookup and extent, quad lists' indices, immediate
+mode's vertices. Each draw's data is copied into Direct3D buffers at the
+draw, exactly as d3d8_gl.c copies it into GL buffers, and then the draw stops
+where GL drew: its draws are still counted and dropped. One thing of
+d3d8_gl.c's design is changed: the rings are not orphaned at every frame
+(Present), since Map with D3D11_MAP_WRITE_NO_OVERWRITE promises what GL's
+orphaning gave; they are orphaned when full. The answers the game reads
 back are the OpenGL build's where they do not depend on the GPU; the one that
 does, a visibility test, reports 0 samples. The Direct3D 11 device is the backend's
 (port/windows/d3d11/win32_d3d11.c, through d3d11_backend.h), made with the
@@ -312,6 +326,11 @@ struct vertex_shader_object
 
 /* ---------- the device */
 
+/* the stream and index rings (the backend's, D3D11_USAGE_DYNAMIC): the
+desktop's sizes in d3d8_gl.c */
+#define STREAM_BUFFER_SIZE (32 * 1024 * 1024)
+#define INDEX_BUFFER_SIZE (8 * 1024 * 1024)
+
 struct d3d11_device
 {
 	D3DPRESENT_PARAMETERS presentation;
@@ -350,6 +369,11 @@ struct d3d11_device
 	unsigned long immediate_count;
 	unsigned long immediate_capacity;
 
+	/* where the next write goes in each ring (the GL buffers' names were
+	here: the backend owns the two rings) */
+	unsigned long stream_offset;
+	unsigned long index_offset;
+
 	BOOL visibility_test_active;
 
 	unsigned long frame;
@@ -358,6 +382,10 @@ struct d3d11_device
 	backend a Direct3D 11 device on it (d3d11_backend_create) */
 	BOOL window_ready;
 	BOOL backend_ready;
+	/* the backend made the rings and the upload ring
+	(d3d11_backend_memory_initialize): without them the draws' data work is
+	skipped */
+	BOOL buffers_ready;
 	BOOL created;
 	/* the GL stubs' count after the self-test's call (backend_initialize):
 	the statistics give the calls since */
@@ -368,20 +396,27 @@ struct d3d11_device
 	debug.d3d11_present_marker, as of config_changes()'s count read_at */
 	BOOL vsync;
 	unsigned long settings_read_at;
-	/* the swap chain's resizes when the statistics last said */
+	/* the swap chain's resizes, and the rings' discards, when the statistics
+	last said */
 	uint32_t resizes_before;
+	uint32_t discards_before;
 };
 
 static struct d3d11_device device;
 
 /* debug.gpu_stats prints these every 60 frames: what the game asked to be
-drawn, which is dropped; the clears, and how the backend made them; the
-presents; and the debug layer's messages */
+drawn, which is dropped, and the draws skipped; the clears, and how the
+backend made them; the bytes mirrored, streamed and uploaded; the presents;
+and the debug layer's messages */
 static struct
 {
 	unsigned long draws, immediate_draws, clears, presents;
+	unsigned long skipped_no_program, skipped_no_buffer;
 	unsigned long clears_by_calls, clears_drawn;
 	unsigned long target_changes;
+	/* vertex and index bytes drawn from the mirror, and streamed (as
+	d3d8_gl.c counts them); and the bytes written into the mirror's segments */
+	unsigned long mirrored_bytes, streamed_bytes, uploaded_bytes;
 	unsigned long presented, not_presented;
 	unsigned long debug_messages;
 } stats;
@@ -768,12 +803,29 @@ static void backend_initialize(void)
 		d3d11_backend_window_set(platform_video_native_window(), line, sizeof(line));
 		platform_log("%s", line);
 	}
-	/* debug.d3d11_self_test: the clears tried on the backend's own targets */
+	/* the stream and index rings and the mirror's upload ring; without them
+	the game runs on, its draws' data work skipped (counted as no buffer) and
+	the clears still shown */
+	if (device.backend_ready)
+	{
+		device.buffers_ready = d3d11_backend_memory_initialize(STREAM_BUFFER_SIZE, INDEX_BUFFER_SIZE, line,
+			sizeof(line)) != 0;
+		platform_log("%s", line);
+	}
+	/* debug.d3d11_self_test: the clears tried on the backend's own targets,
+	then the memory paths on its rings and a segment of its own */
 	if (device.backend_ready && config_boolean("debug.d3d11_self_test"))
 	{
 		d3d11_backend_self_test(line, sizeof(line));
 		platform_log("%s", line);
+		d3d11_backend_memory_self_test(line, sizeof(line));
+		platform_log("%s", line);
 	}
+	/* the rings start full, so that the first write to each orphans it (a
+	DISCARD map): the self-test's writes went to offsets the device does not
+	know of, which a no-overwrite write must not touch */
+	device.stream_offset = STREAM_BUFFER_SIZE;
+	device.index_offset = INDEX_BUFFER_SIZE;
 	/* the shared files' GL calls reach counted stubs, not null pointers
 	(tools/windows_gl_stubs.py): one called here must be counted (glFlush,
 	which no shared file calls, so that the first-call line it leaves is
@@ -1594,6 +1646,417 @@ static BOOL trace_frame(void)
 	return frame >= 0 && device.frame == (unsigned long)frame;
 }
 
+/* ---------- the contiguous window in Direct3D buffers
+
+Vertex and index buffers live in the Xbox's contiguous memory, where most
+never change once loaded. The mirror keeps a copy of that memory in Direct3D
+buffers (one per segment, created when first needed: the backend's DEFAULT
+buffers) and uploads a page only when it is first drawn from or after the
+game has written it: pages are write-protected once uploaded, as cached
+textures are (memory_watch.c). Pages the game rewrites frame after frame
+(dynamic vertices) would fault on every write; after a few such rewrites a
+page counts as volatile for a while, and draws that use it stream their data
+as before.
+
+(d3d8_gl.c's, copied: the GL buffer names are the backend's segment handles,
+its uploads the backend's segment writes, which go through an upload ring and
+a copy queued in the context in order with the draws. buffer_upload's pieces
+were Mesa's GL thread's and do not come.) */
+
+#define MIRROR_SEGMENT_SIZE 0x400000UL
+#define MIRROR_SEGMENT_COUNT (PLATFORM_CONTIGUOUS_MAXIMUM / MIRROR_SEGMENT_SIZE)
+#define MIRROR_PAGE_SIZE 0x1000UL
+#define MIRROR_PAGE_COUNT (PLATFORM_CONTIGUOUS_MAXIMUM / MIRROR_PAGE_SIZE)
+/* rewrites no more than this many frames apart ... */
+#define MIRROR_REWRITE_FRAMES 2
+/* ... this many times in a row make a page volatile ... */
+#define MIRROR_VOLATILE_REWRITES 4
+/* ... for this many frames */
+#define MIRROR_VOLATILE_FRAMES 600
+
+enum
+{
+	_mirror_page_absent,
+	_mirror_page_present,
+	_mirror_page_volatile
+};
+
+static struct
+{
+	/* the backend's segment (d3d11_backend_segment_create), 0 while none */
+	uint32_t segments[MIRROR_SEGMENT_COUNT];
+	unsigned char state[MIRROR_PAGE_COUNT];
+	unsigned char rewrites[MIRROR_PAGE_COUNT];
+	/* the page's memory_watch generation when it was uploaded */
+	unsigned long generation[MIRROR_PAGE_COUNT];
+	unsigned long rewritten_frame[MIRROR_PAGE_COUNT];
+} mirror;
+
+/* uploads the pages of [first, last) that are absent or stale; FALSE if one
+of them turns out to be volatile, or their segment cannot be made */
+static BOOL mirror_refresh(unsigned long first, unsigned long last)
+{
+	unsigned long page, run;
+	BOOL volatile_page = FALSE;
+	unsigned char stale[256];
+	unsigned long count = last - first;
+
+	if (count > sizeof(stale))
+	{
+		/* a range this long is refreshed in pieces */
+		for (page = first; page < last; page += sizeof(stale))
+		{
+			if (!mirror_refresh(page, page + sizeof(stale) < last ? page + sizeof(stale) : last))
+				return FALSE;
+		}
+		return TRUE;
+	}
+	for (page = first; page < last; page++)
+	{
+		BOOL written = mirror.state[page] == _mirror_page_present &&
+			memory_watch_generation(PLATFORM_CONTIGUOUS_BASE + page * MIRROR_PAGE_SIZE, MIRROR_PAGE_SIZE) >
+			mirror.generation[page];
+
+		stale[page - first] = mirror.state[page] != _mirror_page_present || written;
+		if (written)
+		{
+			if (device.frame - mirror.rewritten_frame[page] <= MIRROR_REWRITE_FRAMES)
+				mirror.rewrites[page]++;
+			else
+				mirror.rewrites[page] = 1;
+			mirror.rewritten_frame[page] = device.frame;
+			if (mirror.rewrites[page] >= MIRROR_VOLATILE_REWRITES)
+			{
+				mirror.state[page] = _mirror_page_volatile;
+				volatile_page = TRUE;
+			}
+		}
+	}
+	if (volatile_page)
+		return FALSE;
+	for (page = first; page < last; page = run)
+	{
+		unsigned long segment = page * MIRROR_PAGE_SIZE / MIRROR_SEGMENT_SIZE;
+		unsigned long address, size;
+
+		if (!stale[page - first])
+		{
+			run = page + 1;
+			continue;
+		}
+		/* (the segment is made before its pages are marked present, where
+		d3d8_gl.c made its GL buffer after: a segment that cannot be made,
+		logged by the backend, leaves them as they were, and the draw streams
+		its data instead) */
+		if (!mirror.segments[segment])
+		{
+			mirror.segments[segment] = d3d11_backend_segment_create(MIRROR_SEGMENT_SIZE);
+			if (!mirror.segments[segment])
+			{
+				backend_lost_check();
+				return FALSE;
+			}
+		}
+		for (run = page; run < last && stale[run - first]; run++)
+		{
+			if (mirror.state[run] != _mirror_page_present)
+			{
+				mirror.rewrites[run] = 0;
+				mirror.rewritten_frame[run] = device.frame;
+			}
+		}
+		address = PLATFORM_CONTIGUOUS_BASE + page * MIRROR_PAGE_SIZE;
+		size = (run - page) * MIRROR_PAGE_SIZE;
+		/* protect first, so a write racing with the upload is noticed */
+		memory_watch_protect(address, size);
+		for (; page < run; page++)
+		{
+			mirror.generation[page] = memory_watch_generation(PLATFORM_CONTIGUOUS_BASE + page * MIRROR_PAGE_SIZE,
+				MIRROR_PAGE_SIZE);
+			mirror.state[page] = _mirror_page_present;
+		}
+		/* (a write that fails is the lost device's, which nothing reads after) */
+		if (!d3d11_backend_segment_write(mirror.segments[segment],
+			(uint32_t)(address - PLATFORM_CONTIGUOUS_BASE - segment * MIRROR_SEGMENT_SIZE), (const void *)address,
+			(uint32_t)size))
+		{
+			backend_lost_check();
+		}
+		stats.uploaded_bytes += size;
+	}
+	return TRUE;
+}
+
+/* makes [address, address + size) current in the mirror, giving the segment
+that holds it, the range's offset in that segment and the newest upload
+generation of its pages (which changes whenever its contents do); FALSE if
+the range is outside the window, spans two segments or is volatile */
+static BOOL mirror_range(unsigned long address, unsigned long size, uint32_t *segment_handle, unsigned long *offset,
+	unsigned long *generation)
+{
+	unsigned long start = address - PLATFORM_CONTIGUOUS_BASE;
+	unsigned long segment, first, last, page, oldest = ~0UL, newest = 0;
+	BOOL present = TRUE;
+
+	if (!size || address < PLATFORM_CONTIGUOUS_BASE || start + size > PLATFORM_CONTIGUOUS_SIZE)
+		return FALSE;
+	segment = start / MIRROR_SEGMENT_SIZE;
+	if ((start + size - 1) / MIRROR_SEGMENT_SIZE != segment)
+		return FALSE;
+	first = start / MIRROR_PAGE_SIZE;
+	last = (start + size - 1) / MIRROR_PAGE_SIZE + 1;
+	for (page = first; page < last; page++)
+	{
+		if (mirror.state[page] == _mirror_page_volatile)
+		{
+			if (device.frame - mirror.rewritten_frame[page] < MIRROR_VOLATILE_FRAMES)
+				return FALSE;
+			mirror.state[page] = _mirror_page_absent;
+		}
+		if (mirror.state[page] != _mirror_page_present)
+		{
+			present = FALSE;
+		}
+		else
+		{
+			if (mirror.generation[page] < oldest)
+				oldest = mirror.generation[page];
+			if (mirror.generation[page] > newest)
+				newest = mirror.generation[page];
+		}
+	}
+	if (!present || memory_watch_generation(address, size) > oldest)
+	{
+		if (!mirror_refresh(first, last))
+			return FALSE;
+		for (newest = 0, page = first; page < last; page++)
+		{
+			if (mirror.generation[page] > newest)
+				newest = mirror.generation[page];
+		}
+	}
+	*segment_handle = mirror.segments[segment];
+	*offset = start - segment * MIRROR_SEGMENT_SIZE;
+	if (generation)
+		*generation = newest;
+	stats.mirrored_bytes += size;
+	return TRUE;
+}
+
+/* the smallest and largest index of an index range the mirror holds: the
+same ranges are drawn frame after frame */
+#define INDEX_RANGE_SLOTS 4096
+
+static struct
+{
+	unsigned long address;
+	unsigned long count;
+	unsigned long generation;
+	WORD minimum;
+	WORD maximum;
+} index_ranges[INDEX_RANGE_SLOTS];
+
+static void index_extent(const WORD *indices, unsigned long count, unsigned long generation, BOOL cached,
+	unsigned long *minimum, unsigned long *maximum)
+{
+	unsigned long slot = (((unsigned long)indices >> 1) ^ (count * 2654435761UL)) % INDEX_RANGE_SLOTS;
+	unsigned long index, low = 0xffff, high = 0;
+
+	if (cached && index_ranges[slot].address == (unsigned long)indices && index_ranges[slot].count == count &&
+		index_ranges[slot].generation == generation)
+	{
+		*minimum = index_ranges[slot].minimum;
+		*maximum = index_ranges[slot].maximum;
+		return;
+	}
+	for (index = 0; index < count; index++)
+	{
+		if (indices[index] < low)
+			low = indices[index];
+		if (indices[index] > high)
+			high = indices[index];
+	}
+	if (cached)
+	{
+		index_ranges[slot].address = (unsigned long)indices;
+		index_ranges[slot].count = count;
+		index_ranges[slot].generation = generation;
+		index_ranges[slot].minimum = (WORD)low;
+		index_ranges[slot].maximum = (WORD)high;
+	}
+	*minimum = low;
+	*maximum = high;
+}
+
+/* ---------- vertex data */
+
+/* makes room for size bytes of uploads, orphaning the stream ring if it is
+full. A draw reserves room for all of its streams at once: orphaning between
+two of them would leave the streams already placed in the ring reading its
+new, empty storage. */
+static void stream_reserve(unsigned long size)
+{
+	if (device.stream_offset + size > STREAM_BUFFER_SIZE)
+	{
+		/* orphan the ring and start again: the backend's next write to it
+		maps it with D3D11_MAP_WRITE_DISCARD */
+		d3d11_backend_ring_orphan(D3D11_BACKEND_RING_STREAM);
+		device.stream_offset = 0;
+	}
+}
+
+static unsigned long stream_upload(const void *data, unsigned long size)
+{
+	unsigned long offset;
+
+	size = (size + 15) & ~15UL;
+	stream_reserve(size);
+	offset = device.stream_offset;
+	/* (a write that fails is the lost device's, or one past the ring's end,
+	logged by the backend) */
+	if (!d3d11_backend_ring_write(D3D11_BACKEND_RING_STREAM, (uint32_t)offset, data, (uint32_t)size))
+		backend_lost_check();
+	device.stream_offset += size;
+	return offset;
+}
+
+static unsigned long index_upload(const void *data, unsigned long size)
+{
+	unsigned long offset;
+
+	size = (size + 15) & ~15UL;
+	if (device.index_offset + size > INDEX_BUFFER_SIZE)
+	{
+		d3d11_backend_ring_orphan(D3D11_BACKEND_RING_INDEX);
+		device.index_offset = 0;
+	}
+	offset = device.index_offset;
+	if (!d3d11_backend_ring_write(D3D11_BACKEND_RING_INDEX, (uint32_t)offset, data, (uint32_t)size))
+		backend_lost_check();
+	device.index_offset += size;
+	return offset;
+}
+
+/* a stream placed in the stream ring rather than in a segment (stream_data):
+the GL renderer named its stream buffer there */
+#define STREAMED_IN_RING 0xffffffffu
+
+/* setup_streams' data work (d3d8_gl.c): each stream the draw's declaration
+reads, from the mirror where it can be, else streamed; the vertex array, its
+buffers and the attributes' values are phase 6's */
+static void stream_data(unsigned long first, unsigned long count)
+{
+	struct vertex_shader_object *declaration = device.vertex_shader;
+	uint32_t stream_buffers[16];
+	unsigned long stream_offsets[16];
+	BOOL placed[16] = { FALSE };
+	unsigned long index, total = 0;
+
+	/* the mirror first; then one reservation for everything streamed */
+	for (index = 0; index < declaration->element_count; index++)
+	{
+		const struct vertex_element *element = &declaration->elements[index];
+		unsigned long stream = element->stream;
+		unsigned long stride = device.streams[stream].stride;
+		unsigned long bytes = stride ? stride * count : 64;
+		unsigned long base;
+
+		if (!device.streams[stream].data || element->type == D3DVSDT_NONE || placed[stream])
+			continue;
+		placed[stream] = TRUE;
+		stream_buffers[stream] = 0;
+		base = (unsigned long)PLATFORM_PHYSICAL_TO_VIRTUAL(device.streams[stream].data) + first * stride;
+		if (mirror_range(base, bytes, &stream_buffers[stream], &stream_offsets[stream], NULL))
+			continue;
+		stream_buffers[stream] = 0;
+		total += (bytes + 15) & ~15UL;
+	}
+	stream_reserve(total);
+	for (index = 0; index < declaration->element_count; index++)
+	{
+		const struct vertex_element *element = &declaration->elements[index];
+		unsigned long stream = element->stream;
+		unsigned long stride = device.streams[stream].stride;
+
+		if (!device.streams[stream].data || element->type == D3DVSDT_NONE)
+			continue;
+		if (!stream_buffers[stream])
+		{
+			const unsigned char *base = PLATFORM_PHYSICAL_TO_VIRTUAL(device.streams[stream].data);
+			unsigned long bytes = stride ? stride * count : 64;
+
+			stream_offsets[stream] = stream_upload(base + first * stride, bytes);
+			stream_buffers[stream] = STREAMED_IN_RING;
+			stats.streamed_bytes += bytes;
+		}
+		/* (the element's attribute in the vertex layout, layout_attribute,
+		and the streams it uses: phase 6) */
+	}
+	/* (the vertex array from the layout, vertex_array_get and
+	state_vertex_array; each stream used bound at its buffer and offset,
+	state_vertex_buffer; the attributes no element feeds given their current
+	values, state_attribute_value: phase 6) */
+	(void)stream_offsets;
+}
+
+/* quads become two triangles each */
+static WORD *quad_indices(const WORD *indices, unsigned long count, unsigned long *out_count)
+{
+	unsigned long quads = count / 4;
+	WORD *result = malloc(quads * 6 * sizeof(WORD) + 2);
+	unsigned long quad;
+
+	for (quad = 0; quad < quads; quad++)
+	{
+		WORD v0 = indices ? indices[quad * 4] : (WORD)(quad * 4);
+		WORD v1 = indices ? indices[quad * 4 + 1] : (WORD)(quad * 4 + 1);
+		WORD v2 = indices ? indices[quad * 4 + 2] : (WORD)(quad * 4 + 2);
+		WORD v3 = indices ? indices[quad * 4 + 3] : (WORD)(quad * 4 + 3);
+
+		result[quad * 6 + 0] = v0;
+		result[quad * 6 + 1] = v1;
+		result[quad * 6 + 2] = v2;
+		result[quad * 6 + 3] = v0;
+		result[quad * 6 + 4] = v2;
+		result[quad * 6 + 5] = v3;
+	}
+	*out_count = quads * 6;
+	return result;
+}
+
+/* prepare_draw's guards (d3d8_gl.c): a draw with no program, no vertex
+shader or no instructions is skipped, as is one debug.gpu_skip_vertex_shaders
+names; and here, a draw with no rings to copy its data into. The rest of
+prepare_draw (the key, the program, the state) is phases 4 and 5's. */
+static BOOL draw_ready(void)
+{
+	struct vertex_shader_object *program = current_program();
+
+	if (!device.backend_ready || !program || !device.vertex_shader || !program->instructions)
+	{
+		stats.skipped_no_program++;
+		return FALSE;
+	}
+	{
+		const char *skip = debug_settings.skip_vertex_shaders;
+
+		while (skip && *skip)
+		{
+			if ((unsigned long)atol(skip) == program->id)
+				return FALSE;
+			skip = strchr(skip, ',');
+			if (skip)
+				skip++;
+		}
+	}
+	if (!device.buffers_ready)
+	{
+		stats.skipped_no_buffer++;
+		return FALSE;
+	}
+	return TRUE;
+}
+
 void WINAPI D3DDevice_SetStreamSource(UINT stream_number, D3DVertexBuffer *stream_data, UINT stride)
 {
 	if (stream_number >= 16)
@@ -1613,18 +2076,56 @@ void WINAPI D3DDevice_SetIndices(D3DIndexBuffer *index_data, UINT base_vertex_in
 
 void WINAPI D3DDevice_DrawVertices(D3DPRIMITIVETYPE primitive_type, UINT start_vertex, UINT vertex_count)
 {
-	(void)primitive_type;
-	(void)start_vertex;
-	if (!vertex_count)
+	if (!vertex_count || !draw_ready())
 		return;
+	stream_data(start_vertex, vertex_count);
+	if (primitive_type == D3DPT_QUADLIST)
+	{
+		unsigned long count;
+		WORD *indices = quad_indices(NULL, vertex_count, &count);
+
+		/* (glDrawElements from the indices at this offset: phase 6) */
+		index_upload(indices, count * sizeof(WORD));
+		free(indices);
+	}
+	/* (else glDrawArrays: phase 6) */
 	stats.draws++;
 }
 
 void WINAPI D3DDevice_DrawIndexedVertices(D3DPRIMITIVETYPE primitive_type, UINT vertex_count, CONST WORD *index_data)
 {
-	(void)primitive_type;
-	if (!vertex_count || !index_data)
+	unsigned long minimum, maximum, count, generation = 0, index_offset = 0;
+	WORD *indices = NULL;
+	const WORD *source = index_data;
+	uint32_t index_segment = 0;
+	BOOL mirrored;
+
+	if (!vertex_count || !index_data || !draw_ready())
 		return;
+	/* quads are drawn as triangles, from indices made for the draw */
+	mirrored = primitive_type != D3DPT_QUADLIST &&
+		mirror_range((unsigned long)index_data, vertex_count * sizeof(WORD), &index_segment, &index_offset, &generation);
+	index_extent(index_data, vertex_count, generation, mirrored, &minimum, &maximum);
+	/* (the streams from the base vertex on: index i is vertex base + i) */
+	stream_data(device.base_vertex_index + minimum, maximum - minimum + 1);
+	if (mirrored)
+	{
+		/* (glDrawElementsBaseVertex from the segment's indices at
+		index_offset, the attributes starting at vertex minimum: phase 6) */
+		(void)index_segment;
+		stats.draws++;
+		return;
+	}
+	stats.streamed_bytes += vertex_count * sizeof(WORD);
+	count = vertex_count;
+	if (primitive_type == D3DPT_QUADLIST)
+	{
+		indices = quad_indices(index_data, vertex_count, &count);
+		source = indices;
+	}
+	/* (glDrawElementsBaseVertex from the indices at this offset: phase 6) */
+	index_upload(source, count * sizeof(WORD));
+	free(indices);
 	stats.draws++;
 }
 
@@ -1653,9 +2154,28 @@ static void immediate_emit(void)
 
 void WINAPI D3DDevice_End(void)
 {
+	unsigned long stride = XGPU_VERTEX_ATTRIBUTE_COUNT * 4 * sizeof(float);
+	unsigned long count = device.immediate_count;
+	D3DPRIMITIVETYPE type = device.immediate_type;
+
 	device.immediate_active = FALSE;
-	if (!device.immediate_count)
+	if (!count || !draw_ready())
 		return;
+	/* (the vertices streamed; every attribute four floats, one after
+	another: the immediate vertex array, layout_attribute, vertex_array_get,
+	and the ring bound at the offset this returns, state_vertex_buffer, are
+	phase 6's) */
+	stream_upload(device.immediate_vertices, count * stride);
+	if (type == D3DPT_QUADLIST)
+	{
+		unsigned long index_count;
+		WORD *indices = quad_indices(NULL, count, &index_count);
+
+		/* (glDrawElements from the indices at this offset: phase 6) */
+		index_upload(indices, index_count * sizeof(WORD));
+		free(indices);
+	}
+	/* (else glDrawArrays: phase 6) */
 	stats.immediate_draws++;
 }
 
@@ -1926,24 +2446,33 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 	if (debug_settings.statistics && device.frame % 60 == 0)
 	{
 		/* (draws, clears and target changes a frame, as d3d8_gl.c's line has
-		them; the targets alive; the presents and resizes since the last
+		them, and its skipped draws over the 60 frames; the targets alive; the
+		KB mirrored and streamed a frame, as d3d8_gl.c's line has them, the KB
+		written into segments a frame, the segments alive and the rings'
+		discards since the last line; the presents and resizes since the last
 		line; the stub calls since the start, which phase 6 brings to 0; the
 		layer's messages since the last line, when debug.d3d11_debug asks for
 		the layer) */
 		char layer[64] = "";
-		uint32_t resizes = d3d11_backend_resizes();
+		uint32_t resizes = d3d11_backend_resizes(), discards = d3d11_backend_ring_discards();
 
 		if (config_boolean("debug.d3d11_debug"))
 			snprintf(layer, sizeof(layer), "; %lu debug layer messages", stats.debug_messages);
-		platform_log("frame %lu: Direct3D 11 clears only; %lu draws, %lu immediate dropped; %lu clears (%lu by clear "
-			"calls, %lu drawn), %lu target changes, %lu targets; %lu presented, %lu not; %lu swap chain resizes; "
-			"%lu GL stub calls%s",
+		platform_log("frame %lu: Direct3D 11 clears only; %lu draws, %lu immediate dropped, skipped %lu no program, "
+			"%lu no buffer; %lu clears (%lu by clear calls, %lu drawn), %lu target changes, %lu targets; %lu KB "
+			"mirrored, %lu KB streamed, %lu KB uploaded to %lu segments, %lu ring discards; %lu presented, %lu not; "
+			"%lu swap chain resizes; %lu GL stub calls%s",
 			device.frame, stats.draws / stats.presents, stats.immediate_draws / stats.presents,
+			stats.skipped_no_program, stats.skipped_no_buffer,
 			stats.clears / stats.presents, stats.clears_by_calls / stats.presents, stats.clears_drawn / stats.presents,
-			stats.target_changes / stats.presents, (unsigned long)d3d11_backend_targets_alive(), stats.presented,
+			stats.target_changes / stats.presents, (unsigned long)d3d11_backend_targets_alive(),
+			stats.mirrored_bytes / stats.presents / 1024, stats.streamed_bytes / stats.presents / 1024,
+			stats.uploaded_bytes / stats.presents / 1024, (unsigned long)d3d11_backend_segments_alive(),
+			(unsigned long)(discards - device.discards_before), stats.presented,
 			stats.not_presented, (unsigned long)(resizes - device.resizes_before),
 			gl_stubs_calls() - device.gl_stub_calls_before, layer);
 		device.resizes_before = resizes;
+		device.discards_before = discards;
 		memset(&stats, 0, sizeof(stats));
 	}
 	platform_pump_events();

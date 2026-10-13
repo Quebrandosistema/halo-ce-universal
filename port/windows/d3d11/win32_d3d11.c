@@ -17,6 +17,11 @@ compiler's loading, the read-back for screenshots, the clears' self-test, and
 the lost device. The swap chain and the present are win32_d3d11_present.c's;
 what the two share is in win32_d3d11.h.
 
+Phase 3: the compiler exported to the backend's units (d3d11_backend_compile,
+which the memory self-test's pipeline needs), and the targets' making,
+freeing and read-back with it; the memory unit (win32_d3d11_memory.c)
+released by destroy.
+
 hr_text, drain_debug (as backend_drain_debug), choose_adapter and
 create_device are copied from phase 0's probe (win32_d3d11_probe.c), where they
 were tried on this machine's Adreno and on WARP, and changed only for what the
@@ -411,10 +416,11 @@ void d3d11_backend_destroy(void)
 		return;
 	backend_drain_debug();
 	ID3D11DeviceContext_ClearState(B.context);
-	/* the present's objects, then the targets and the clears'; the flush
-	after them lets the context destroy what it still held of them (the
-	live-object report counts an object until then) */
+	/* the present's objects, the memory unit's, then the targets and the
+	clears'; the flush after them lets the context destroy what it still held
+	of them (the live-object report counts an object until then) */
 	d3d11_backend_present_release();
+	d3d11_backend_memory_release();
 	resources_release();
 	ID3D11DeviceContext_Flush(B.context);
 	release(&B.context);
@@ -529,19 +535,27 @@ static int load_compiler(void)
 	return 1;
 }
 
-static int compile(const char *entry, const char *target, ID3DBlob **code)
+int d3d11_backend_compile(const char *source, size_t size, const char *name, const char *entry, const char *target,
+	ID3DBlob **code)
 {
 	ID3DBlob *messages = NULL;
 	HRESULT result;
 
-	result = S.compile(builtin_hlsl, sizeof(builtin_hlsl) - 1, "builtin", NULL, NULL, entry, target,
-		D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, code, &messages);
+	if (!load_compiler())
+		return 0;
+	result = S.compile(source, size, name, NULL, NULL, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, code,
+		&messages);
 	if (FAILED(result))
-		platform_log("d3d11: the built-in shader %s (%s) did not compile (%s): %.*s", entry, target, hr_text(result),
+		platform_log("d3d11: the %s shader %s (%s) did not compile (%s): %.*s", name, entry, target, hr_text(result),
 			messages ? (int)ID3D10Blob_GetBufferSize(messages) : 0,
 			messages ? (const char *)ID3D10Blob_GetBufferPointer(messages) : "");
 	release(&messages);
 	return SUCCEEDED(result);
+}
+
+static int compile(const char *entry, const char *target, ID3DBlob **code)
+{
+	return d3d11_backend_compile(builtin_hlsl, sizeof(builtin_hlsl) - 1, "built-in", entry, target, code);
 }
 
 static int make_shaders(void)
@@ -662,16 +676,6 @@ The game's, made when the device first finds a surface it draws into
 upward) and never freed, as d3d8_gl.c keeps its textures; and the self-test's
 own, made and released by it. */
 
-struct target
-{
-	ID3D11Texture2D *texture;
-	ID3D11RenderTargetView *color;
-	ID3D11DepthStencilView *depth;
-	ID3D11ShaderResourceView *view;
-	uint32_t width, height;
-	int is_depth;
-};
-
 static struct target *targets;
 static uint32_t target_count, target_capacity;
 
@@ -682,7 +686,7 @@ static struct target *bound_color, *bound_depth;
 static ID3D11Texture2D *staging;
 static uint32_t staging_width, staging_height;
 
-static void target_free(struct target *target)
+void target_free(struct target *target)
 {
 	release(&target->view);
 	release(&target->depth);
@@ -690,7 +694,7 @@ static void target_free(struct target *target)
 	release(&target->texture);
 }
 
-static int target_make(struct target *target, uint32_t width, uint32_t height, int depth)
+int target_make(struct target *target, uint32_t width, uint32_t height, int depth)
 {
 	static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 	D3D11_TEXTURE2D_DESC description;
@@ -941,7 +945,7 @@ uint32_t d3d11_backend_clear(uint32_t channels, const float color[4], float z, u
 
 /* ---------- the read-back */
 
-static int read_target(struct target *target, void *pixels, size_t size)
+int read_target(struct target *target, void *pixels, size_t size)
 {
 	D3D11_TEXTURE2D_DESC description;
 	D3D11_MAPPED_SUBRESOURCE mapped;

@@ -2,8 +2,9 @@
 WIN32_D3D11.H
 
 What the Direct3D 11 backend's own units share (port/windows/D3D11.md):
-win32_d3d11.c (the device, the targets, the clears, the built-in shaders) and
-win32_d3d11_present.c (the swap chain and the present). Windows SDK's types:
+win32_d3d11.c (the device, the targets, the clears, the built-in shaders and
+the compiler), win32_d3d11_present.c (the swap chain and the present) and
+win32_d3d11_memory.c (the rings, the segments, the upload ring). Windows SDK's types:
 only the Windows-facing units include it; the device (d3d8_d3d11.c) sees
 d3d11_backend.h alone.
 */
@@ -95,5 +96,39 @@ extern ID3D11RasterizerState *d3d11_backend_scissored;
 
 /* a target's shader resource view (0 or a depth target: NULL) */
 ID3D11ShaderResourceView *d3d11_backend_target_view(uint32_t handle, uint32_t *width, uint32_t *height);
+
+/* HLSL compiled through d3dcompiler_47.dll (loaded at the first call) at
+D3DCOMPILE_OPTIMIZATION_LEVEL3; name is the source's in messages. 1 with the
+bytecode in code; 0 if the compiler is missing or the source did not compile
+(logged with the compiler's messages). */
+int d3d11_backend_compile(const char *source, size_t size, const char *name, const char *entry, const char *target,
+	ID3DBlob **code);
+
+/* a target of the backend's: the game's (d3d11_backend_target_create) and
+the self-tests' own */
+struct target
+{
+	ID3D11Texture2D *texture;
+	ID3D11RenderTargetView *color;
+	ID3D11DepthStencilView *depth;
+	ID3D11ShaderResourceView *view;
+	uint32_t width, height;
+	int is_depth;
+};
+
+/* a colour (B8G8R8A8_UNORM) or depth target made and cleared once; 0 if it
+was not made (logged) */
+int d3d11_backend_target_make(struct target *target, uint32_t width, uint32_t height, int depth);
+#define target_make d3d11_backend_target_make
+void d3d11_backend_target_free(struct target *target);
+#define target_free d3d11_backend_target_free
+/* a colour target's pixels, BGRA rows from the top, through a staging
+texture (the Map waits for the GPU); 0 if not read (logged) */
+int d3d11_backend_read_target(struct target *target, void *pixels, size_t size);
+#define read_target d3d11_backend_read_target
+
+/* the memory unit's objects released (d3d11_backend_destroy, after the
+present's and before the targets') */
+void d3d11_backend_memory_release(void);
 
 #endif
