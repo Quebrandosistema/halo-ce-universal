@@ -87,6 +87,11 @@ static struct platform_ui_pointer scoreboard_pointer;
 #endif
 static BOOL scoreboard_pointer_active;
 
+/* the console's keys (halo_keyboard_press), under input_lock: the frames
+each is still held for, and whether any is */
+static long key_press_frames[SDL_SCANCODE_COUNT];
+static BOOL key_press_any;
+
 /* debug keyboard queue */
 #define KEYSTROKE_QUEUE_SIZE 64
 static struct platform_keystroke keystroke_queue[KEYSTROKE_QUEUE_SIZE];
@@ -1951,10 +1956,42 @@ void platform_video_window_size(int *width, int *height)
 }
 
 #endif
+int halo_keyboard_press(const char *name, long frames)
+{
+	SDL_Scancode scancode = name ? SDL_GetScancodeFromName(name) : SDL_SCANCODE_UNKNOWN;
+
+	if (scancode == SDL_SCANCODE_UNKNOWN || scancode >= SDL_SCANCODE_COUNT)
+		return 0;
+	pthread_mutex_lock(&input_lock);
+	input_state.keys[scancode] = 1;
+	keys_pressed[scancode] = 1;
+	key_press_frames[scancode] = frames > 1 ? frames : 1;
+	key_press_any = TRUE;
+	pthread_mutex_unlock(&input_lock);
+	return 1;
+}
+
 void platform_input_read(struct platform_input_state *state, BOOL consume_motion)
 {
 	pthread_mutex_lock(&input_lock);
 	*state = input_state;
+	/* (the console's keys are let go after the frames asked: this read's
+	state has them still) */
+	if (key_press_any && consume_motion)
+	{
+		int scancode;
+
+		key_press_any = FALSE;
+		for (scancode = 0; scancode < SDL_SCANCODE_COUNT; scancode++)
+		{
+			if (!key_press_frames[scancode])
+				continue;
+			if (--key_press_frames[scancode])
+				key_press_any = TRUE;
+			else
+				input_state.keys[scancode] = 0;
+		}
+	}
 	/* (rebinding: nothing reaches the controller until the input is taken
 	and every key and button is up again) */
 	if (binding_capture != _binding_capture_idle || binding_settling)

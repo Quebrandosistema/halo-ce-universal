@@ -48,5 +48,13 @@ unsigned long halo_keyboard_actions(short controller_index);
 /* whether voice chat's push to talk is held (controls.push_to_talk), in the
 game and in the menus alike */
 int halo_push_to_talk_held(void);
+/* the console's key_press (hs/hs.c): the key named as SDL names keys
+("down", "return", "escape", "a"; the case does not matter) pressed as if
+typed at the window, and held for that many frames (reads of the input),
+so a script can walk the menus from outside (debug.telnet_console) without
+the window in front. 0 when no key has the name. It presses the game's and
+the menus' keys, not the developer console's: what is typed there is the
+debug keyboard's, another path. (sdl_platform.c) */
+int halo_keyboard_press(const char *name, long frames);
 
 #endif

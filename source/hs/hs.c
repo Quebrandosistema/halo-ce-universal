@@ -2844,6 +2844,7 @@ symbols in this file:
 #ifdef HALO_PROFILE
 #include "profile_console.h" /* port: port/linux/game/profile_console.c */
 #endif
+#include "halo_keyboard.h" /* port: port/linux/src/sdl_platform.c */
 
 /* ---------- constants */
 
@@ -3334,6 +3335,13 @@ struct hs_arguments_long_string
 	char const *value1;
 };
 
+/* port: key_press */
+struct hs_arguments_string_long
+{
+	char const *value0;
+	long value1;
+};
+
 struct hs_arguments_long_long
 {
 	long value0;
@@ -3382,7 +3390,7 @@ typedef void (*hs_token_enumerator)(
 
 struct hs_function_table_storage
 {
-	struct hs_function_definition const *functions[418 + 4];
+	struct hs_function_definition const *functions[418 + 5];
 	struct profile_section profile;
 	hs_token_enumerator token_enumerators[18];
 };
@@ -11737,7 +11745,28 @@ static struct hs_function_definition_with_1_parameter const loose_sounds_definit
 	},
 };
 
-long const hs_function_table_count= 418 + 4;
+/* port: a key of the window pressed from the console (halo_keyboard_press:
+port/linux/src/sdl_platform.c), so a script can walk the menus from outside
+(debug.telnet_console) without the window in front */
+HS_EVALUATE_RETURN_BOOLEAN(hs_key_press_evaluate, struct hs_arguments_string_long, (halo_keyboard_press(arguments->value0, arguments->value1) != 0))
+
+static struct hs_function_definition_with_2_parameters const key_press_definition=
+{
+	{
+		_hs_type_boolean,
+		0,
+		"key_press",
+		hs_macro_function_parse,
+		hs_key_press_evaluate,
+		"presses a key of the window (named as SDL names keys: down, return, escape, a) for that many frames; false when no key has the name.",
+		NULL,
+		2,
+		{ _hs_type_string },
+	},
+	{ _hs_type_long_integer },
+};
+
+long const hs_function_table_count= 418 + 5;
 
 struct hs_enum_definition const hs_enum_table[]=
 {
@@ -12173,6 +12202,7 @@ struct hs_function_table_storage hs_function_table=
 		&sv_end_game_definition,
 		&loose_sounds_reload_definition,
 		&loose_sounds_definition.definition,
+		&key_press_definition.definition,
 	},
 	{
 		"hs_update",
@@ -12678,6 +12708,9 @@ static boolean const hs_function_allowed_in_maps[]=
 	/* the port's, for those making sounds */
 	FALSE, /* loose_sounds_reload */
 	FALSE, /* loose_sounds */
+
+	/* the port's, for scripts that drive the game from outside */
+	FALSE, /* key_press: the console's */
 };
 typedef char verify_hs_function_allowed_in_maps_size[
 	NUMBEROF(hs_function_allowed_in_maps) == NUMBEROF(hs_function_table.functions) ? 1 : -1];
