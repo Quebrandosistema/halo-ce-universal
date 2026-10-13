@@ -19,9 +19,13 @@ Vulkan renderer's first device (port/android/guest/d3d8_vk.c at b5038d02).
 Changes to d3d8_gl.c are not followed automatically: later phases copy
 decisions from d3d8_gl.c as it is then, and say so.
 
-Nothing is drawn yet. The answers the game reads back are the OpenGL build's
-where they do not depend on the GPU; the one that does, a visibility test,
-reports 0 samples. The Direct3D 11 device is the backend's
+Phase 2 brought back, with the backend's calls in place of the GL, d3d8_gl.c's
+render target table (render_target_get, bind_targets), Clear's arithmetic,
+the screenshot writer and the letterboxed present (the backend draws it),
+and the menus' pointer as d3d8_gl.c has it: the game's clears are on the
+screen. Its draws are still counted and dropped. The answers the game reads
+back are the OpenGL build's where they do not depend on the GPU; the one that
+does, a visibility test, reports 0 samples. The Direct3D 11 device is the backend's
 (port/windows/d3d11/win32_d3d11.c, through d3d11_backend.h), made with the
 window, which the platform layer makes without an OpenGL context
 (platform_video_without_gl). The GL calls the shared files still make go to
@@ -358,16 +362,27 @@ struct d3d11_device
 	/* the GL stubs' count after the self-test's call (backend_initialize):
 	the statistics give the calls since */
 	unsigned long gl_stub_calls_before;
+	/* the backend's targets last bound (bind_targets), 0 for none */
+	uint32_t bound_color, bound_depth;
+	/* display.vsync, the present's sync interval, and
+	debug.d3d11_present_marker, as of config_changes()'s count read_at */
+	BOOL vsync;
+	unsigned long settings_read_at;
+	/* the swap chain's resizes when the statistics last said */
+	uint32_t resizes_before;
 };
 
 static struct d3d11_device device;
 
 /* debug.gpu_stats prints these every 60 frames: what the game asked to be
-drawn and cleared, which nothing draws yet; and the debug layer's messages */
+drawn, which is dropped; the clears, and how the backend made them; the
+presents; and the debug layer's messages */
 static struct
 {
 	unsigned long draws, immediate_draws, clears, presents;
+	unsigned long clears_by_calls, clears_drawn;
 	unsigned long target_changes;
+	unsigned long presented, not_presented;
 	unsigned long debug_messages;
 } stats;
 
@@ -498,8 +513,39 @@ void WINAPI D3DDevice_BlockUntilVerticalBlank(void)
 
 /* ---------- render targets
 
-The game's surfaces, as the game sees them; their Direct3D 11 targets are
-phase 6's. */
+The game's surfaces it draws into, as d3d8_gl.c finds them (its render
+target table, copied), each with the backend's target in place of the GL
+texture. */
+
+struct render_target_entry
+{
+	struct render_target_entry *next;
+	/* the next with the same address bucket (render_target_bucket) */
+	struct render_target_entry *next_in_bucket;
+	struct xgpu_render_target target;
+	unsigned long last_rendered;
+	/* the back buffer or its depth buffer, which the 3D view is drawn into:
+	multisampled with multisampling (render_target_multisample) */
+	BOOL screen_buffer;
+	/* the backend's target (d3d11_backend_target_create), 0 while it has
+	none: then every use of the entry is skipped */
+	uint32_t backend_target;
+};
+
+/* every draw looks up its targets and whether its textures are render
+targets, of which there are dozens */
+#define RENDER_TARGET_BUCKET_COUNT 256
+
+static struct render_target_entry *render_target_buckets[RENDER_TARGET_BUCKET_COUNT];
+
+static struct render_target_entry **render_target_bucket(unsigned long data)
+{
+	return &render_target_buckets[((data >> 12) ^ (data >> 20)) % RENDER_TARGET_BUCKET_COUNT];
+}
+
+static struct render_target_entry *render_targets;
+
+static void backend_lost_check(void);
 
 static void surface_dimensions(const D3DSurface *surface, unsigned long *width, unsigned long *height, BOOL *depth)
 {
@@ -512,6 +558,191 @@ static void surface_dimensions(const D3DSurface *surface, unsigned long *width, 
 	format = description.format;
 	*depth = format == D3DFMT_D24S8 || format == D3DFMT_F24S8 || format == D3DFMT_D16 || format == D3DFMT_F16 ||
 		format == D3DFMT_LIN_D24S8 || format == D3DFMT_LIN_F24S8 || format == D3DFMT_LIN_D16 || format == D3DFMT_LIN_F16;
+}
+
+/* the shadow maps: the game's only R5G6B5 render targets, 128x128
+(rasterizer_xbox.c) */
+static BOOL surface_is_shadow_map(const D3DSurface *surface)
+{
+	struct xgpu_texture_description description;
+
+	xgpu_texture_describe(surface->Format, surface->Size, &description);
+	return description.format == D3DFMT_R5G6B5 && description.width == SHADOW_MAP_SIZE &&
+		description.height == SHADOW_MAP_SIZE;
+}
+
+/* the targets render_target_get found last, by what it found them from:
+each draw asks again for the same two (bind_targets) */
+#define RECENT_RENDER_TARGET_COUNT 4
+
+static struct
+{
+	DWORD data, format, size;
+	long screen_width;
+	float scale[2];
+	struct render_target_entry *entry;
+} recent_render_targets[RECENT_RENDER_TARGET_COUNT];
+static unsigned long recent_render_target_next;
+
+static struct render_target_entry *render_target_remember(const D3DSurface *surface, long screen,
+	struct render_target_entry *entry)
+{
+	unsigned long slot = recent_render_target_next++ % RECENT_RENDER_TARGET_COUNT;
+
+	recent_render_targets[slot].data = surface->Data;
+	recent_render_targets[slot].format = surface->Format;
+	recent_render_targets[slot].size = surface->Size;
+	recent_render_targets[slot].screen_width = screen;
+	recent_render_targets[slot].scale[0] = screen_scale[0];
+	recent_render_targets[slot].scale[1] = screen_scale[1];
+	recent_render_targets[slot].entry = entry;
+	return entry;
+}
+
+static struct render_target_entry *render_target_get(const D3DSurface *surface)
+{
+	struct render_target_entry *entry;
+	unsigned long width, height, slot;
+	long screen;
+	BOOL depth;
+
+	if (!surface || !surface->Data)
+		return NULL;
+	float scale[2] = { 1.0f, 1.0f };
+
+	/* (the entries are never freed) */
+	screen = halo_screen_width();
+	for (slot = 0; slot < RECENT_RENDER_TARGET_COUNT; slot++)
+	{
+		if (recent_render_targets[slot].entry && recent_render_targets[slot].data == surface->Data &&
+			recent_render_targets[slot].format == surface->Format && recent_render_targets[slot].size == surface->Size &&
+			recent_render_targets[slot].screen_width == screen && recent_render_targets[slot].scale[0] == screen_scale[0] &&
+			recent_render_targets[slot].scale[1] == screen_scale[1])
+		{
+			return recent_render_targets[slot].entry;
+		}
+	}
+	surface_dimensions(surface, &width, &height, &depth);
+	/* the screen's targets are drawn at the screen's scale, and the shadow
+	maps at display.shadow_resolution's (halo_shadow_map_scale) */
+	if (width == (unsigned long)halo_screen_width() && height == SCREEN_HEIGHT)
+	{
+		scale[0] = screen_scale[0];
+		scale[1] = screen_scale[1];
+	}
+	else if (!depth && surface_is_shadow_map(surface))
+	{
+		scale[0] = (float)halo_shadow_map_scale();
+		scale[1] = scale[0];
+	}
+	for (entry = *render_target_bucket(surface->Data); entry; entry = entry->next_in_bucket)
+	{
+		if (entry->target.data == surface->Data && entry->target.width == width &&
+			entry->target.height == height && entry->target.depth == depth &&
+			entry->target.scale[0] == scale[0] && entry->target.scale[1] == scale[1])
+		{
+			return render_target_remember(surface, screen, entry);
+		}
+	}
+	entry = calloc(1, sizeof(*entry));
+	entry->target.data = surface->Data;
+	entry->target.width = width;
+	entry->target.height = height;
+	entry->target.depth = depth;
+	entry->target.scale[0] = scale[0];
+	entry->target.scale[1] = scale[1];
+	entry->target.gl_width = (unsigned long)(width * scale[0] + 0.5f);
+	entry->target.gl_height = (unsigned long)(height * scale[1] + 0.5f);
+	/* (the GL texture's place: the backend's target, made while the backend
+	is ready and logged with its size; one that cannot be made leaves the
+	entry without, logged, and the device lost if that is why) */
+	if (device.backend_ready)
+	{
+		entry->backend_target = d3d11_backend_target_create((uint32_t)entry->target.gl_width,
+			(uint32_t)entry->target.gl_height, depth);
+		if (entry->backend_target)
+			platform_log("Direct3D 11: target %lu: %s %lux%lu for the surface at %08lx (%lux%lu)",
+				(unsigned long)entry->backend_target, depth ? "depth" : "colour", entry->target.gl_width,
+				entry->target.gl_height, (unsigned long)entry->target.data, width, height);
+		else
+		{
+			platform_log("Direct3D 11: no %s target of %lux%lu for the surface at %08lx: what is drawn into it is "
+				"skipped", depth ? "depth" : "colour", entry->target.gl_width, entry->target.gl_height,
+				(unsigned long)entry->target.data);
+			backend_lost_check();
+		}
+	}
+	entry->screen_buffer = surface->Data == (depth ? device.depth_buffer.Data : device.back_buffer.Data);
+	entry->next = render_targets;
+	render_targets = entry;
+	entry->next_in_bucket = *render_target_bucket(entry->target.data);
+	*render_target_bucket(entry->target.data) = entry;
+	return entry;
+}
+
+/* counts draws and clears into render targets (xgpu_render_target.written) */
+static unsigned long render_target_write_serial;
+
+/* the pixels per unit of the bound targets (render_target_get) */
+static float target_scale[2] = { 1.0f, 1.0f };
+
+/* the pixel edge of a coordinate in a target's units, at its scale:
+floorf's, without its call (on 32-bit x86 it saves and restores the FPU's
+rounding, several times a draw) */
+static GLint scaled_pixel(float coordinate, float scale)
+{
+	float value = coordinate * scale + 0.5f;
+	GLint pixel = (GLint)value;
+
+	/* (the conversion is toward zero: a negative value with a fraction
+	rounds down one more) */
+	if ((float)pixel > value)
+		pixel--;
+	return pixel;
+}
+
+/* ... in the bound targets' units */
+static GLint target_pixel(float coordinate, int axis)
+{
+	return scaled_pixel(coordinate, target_scale[axis]);
+}
+
+/* binds the current targets (d3d11_backend_targets_set); returns FALSE if
+there is nothing to draw into */
+static BOOL bind_targets(BOOL *has_depth)
+{
+	struct render_target_entry *color = render_target_get(device.render_target);
+	struct render_target_entry *depth = render_target_get(device.depth_stencil);
+
+	if (depth && !depth->target.depth)
+		depth = NULL;
+	/* (an entry the backend has no target for is not drawn into) */
+	if (color && !color->backend_target)
+		color = NULL;
+	if (depth && !depth->backend_target)
+		depth = NULL;
+	if (!color && !depth)
+		return FALSE;
+	if (color)
+	{
+		color->last_rendered = device.frame + 1;
+		color->target.written = ++render_target_write_serial;
+	}
+	/* viewports and clears are in the targets' units (render_target_get) */
+	target_scale[0] = color ? color->target.scale[0] : depth->target.scale[0];
+	target_scale[1] = color ? color->target.scale[1] : depth->target.scale[1];
+	/* a pair other than the last one bound is a target change (the game
+	names its targets again after each present) */
+	if ((color ? color->backend_target : 0) != device.bound_color ||
+		(depth ? depth->backend_target : 0) != device.bound_depth)
+	{
+		device.bound_color = color ? color->backend_target : 0;
+		device.bound_depth = depth ? depth->backend_target : 0;
+		stats.target_changes++;
+	}
+	d3d11_backend_targets_set(device.bound_color, device.bound_depth);
+	*has_depth = depth != NULL;
+	return TRUE;
 }
 
 /* ---------- device creation */
@@ -530,6 +761,19 @@ static void backend_initialize(void)
 	device.backend_ready = d3d11_backend_create(config_string("display.d3d11_adapter"),
 		config_boolean("debug.d3d11_debug"), line, sizeof(line)) != 0;
 	platform_log("%s", line);
+	/* the swap chain on the window; without it the game runs with the window
+	black, paced as without a device (Present) */
+	if (device.backend_ready)
+	{
+		d3d11_backend_window_set(platform_video_native_window(), line, sizeof(line));
+		platform_log("%s", line);
+	}
+	/* debug.d3d11_self_test: the clears tried on the backend's own targets */
+	if (device.backend_ready && config_boolean("debug.d3d11_self_test"))
+	{
+		d3d11_backend_self_test(line, sizeof(line));
+		platform_log("%s", line);
+	}
 	/* the shared files' GL calls reach counted stubs, not null pointers
 	(tools/windows_gl_stubs.py): one called here must be counted (glFlush,
 	which no shared file calls, so that the first-call line it leaves is
@@ -558,6 +802,19 @@ static void backend_initialize(void)
 	debug_settings.statistics = config_boolean("debug.gpu_stats");
 	if (anti_aliasing_value < 0)
 		anti_aliasing_read();
+	device.settings_read_at = config_changes() - 1;
+}
+
+/* the backend lost its device (d3d11_backend_lost): said once, and the
+backend is called no more; the game goes on, paced without a present */
+static void backend_lost_check(void)
+{
+	if (device.backend_ready && d3d11_backend_lost())
+	{
+		device.backend_ready = FALSE;
+		platform_log("Direct3D 11: the device was lost (%s); the game goes on without a picture",
+			d3d11_backend_lost_reason());
+	}
 }
 
 Direct3D *WINAPI Direct3DCreate8(UINT sdk_version)
@@ -728,50 +985,34 @@ HRESULT WINAPI Direct3D_CreateDevice(UINT adapter, D3DDEVTYPE device_type, void 
 
 /* ---------- the menus' pointer */
 
-/* the back buffer's pixels, as d3d8_gl.c's render target for it has them
-(render_target_get: the screen's size at the screen's scale), which the
-display blit at presentation letterboxes into the window */
-static void back_buffer_pixels(unsigned long *width, unsigned long *height, unsigned long *pixel_width,
-	unsigned long *pixel_height)
-{
-	BOOL depth;
-
-	surface_dimensions(&device.back_buffer, width, height, &depth);
-	*pixel_width = (unsigned long)(*width * screen_scale[0] + 0.5f);
-	*pixel_height = (unsigned long)(*height * screen_scale[1] + 0.5f);
-}
-
 /* a point in the window, as SDL reports it, in the menus' coordinates: the
 inverse of the letterboxed display blit at presentation, the screen's
 width and the menus' centering (halo_screen_ui_offset); or, not centered,
 the screen's (the game's drawing: the scoreboard's) */
 static void ui_point_from_window_on(float window_x, float window_y, int centered, short *x, short *y)
 {
-	unsigned long target_width, target_height, gl_width, gl_height;
+	struct render_target_entry *back_buffer = render_target_get(&device.back_buffer);
 	int window_width, window_height, pixel_width, pixel_height, width, height, left, top;
 	float screen_x, screen_y;
 
 	*x = *y = -1;
-	if (!device.back_buffer.Data)
-		return;
-	back_buffer_pixels(&target_width, &target_height, &gl_width, &gl_height);
-	if (!gl_width || !gl_height)
+	if (!back_buffer)
 		return;
 	platform_video_window_size(&window_width, &window_height);
 	platform_video_drawable_size(&pixel_width, &pixel_height);
 	if (window_width <= 0 || window_height <= 0)
 		return;
 	width = pixel_width;
-	height = (int)((long)pixel_width * gl_height / gl_width);
+	height = (int)((long)pixel_width * back_buffer->target.gl_height / back_buffer->target.gl_width);
 	if (height > pixel_height)
 	{
 		height = pixel_height;
-		width = (int)((long)pixel_height * gl_width / gl_height);
+		width = (int)((long)pixel_height * back_buffer->target.gl_width / back_buffer->target.gl_height);
 	}
 	left = (pixel_width - width) / 2;
 	top = (pixel_height - height) / 2;
-	screen_x = (window_x * pixel_width / window_width - left) * (float)target_width / (float)width;
-	screen_y = (window_y * pixel_height / window_height - top) * (float)target_height / (float)height;
+	screen_x = (window_x * pixel_width / window_width - left) * (float)back_buffer->target.width / (float)width;
+	screen_y = (window_y * pixel_height / window_height - top) * (float)back_buffer->target.height / (float)height;
 	*x = (short)floorf(screen_x - (centered ? (float)(halo_screen_width() - 640) / 2.0f : 0.0f));
 	*y = (short)floorf(screen_y);
 }
@@ -825,7 +1066,7 @@ long halo_screen_commit(void)
 	supersampling changes the scale below) */
 	anti_aliasing_read();
 	/* display.shadow_resolution, if it has changed: the maps' entries at
-	the old scale are no longer found (phase 6's targets) */
+	the old scale stay (render_target_get), but are no longer found */
 	if (shadow_scale && shadow_scale_read_at != config_changes())
 	{
 		long shadow = shadow_scale_choose();
@@ -835,6 +1076,7 @@ long halo_screen_commit(void)
 		{
 			platform_log("shadow maps: %ldx%ld", SHADOW_MAP_SIZE * shadow, SHADOW_MAP_SIZE * shadow);
 			shadow_scale = shadow;
+			memset(recent_render_targets, 0, sizeof(recent_render_targets));
 		}
 	}
 	if (!screen_width)
@@ -912,7 +1154,6 @@ void WINAPI D3DDevice_SetRenderTarget(D3DSurface *render_target, D3DSurface *dep
 	if (trace_frame())
 		platform_log("set render target %08lx depth %08lx", render_target ? (unsigned long)render_target->Data : 0,
 			depth_stencil ? (unsigned long)depth_stencil->Data : 0);
-	stats.target_changes++;
 	if (render_target)
 		device.render_target = render_target;
 	device.depth_stencil = depth_stencil;
@@ -1468,16 +1709,101 @@ void WINAPI D3DDevice_SetVertexDataColor(INT reg, D3DCOLOR color)
 
 /* ---------- clearing */
 
+/* the most rectangles one clear passes to the backend at a time (the game
+gives one or none) */
+#define CLEAR_RECTANGLES 16
+
+static BOOL first_drawn_clear_logged;
+
 void WINAPI D3DDevice_Clear(DWORD count, CONST D3DRECT *rectangles, DWORD flags, D3DCOLOR color, float z, DWORD stencil)
 {
-	(void)rectangles;
-	(void)stencil;
+	float rgba[4];
+	int32_t pixels[CLEAR_RECTANGLES][4];
+	uint32_t channels = 0, made = 0, result;
+	BOOL has_depth = FALSE;
+	DWORD index;
+
 	if (trace_frame())
 		platform_log("clear flags %lx color %08lx z %g count %lu target %08lx depth %08lx", (unsigned long)flags,
 			(unsigned long)color, z, (unsigned long)count,
 			device.render_target ? (unsigned long)device.render_target->Data : 0,
 			device.depth_stencil ? (unsigned long)device.depth_stencil->Data : 0);
 	stats.clears++;
+	if (!device.backend_ready || !bind_targets(&has_depth))
+		return;
+	color_to_vec4(color, rgba);
+	/* the Xbox clears the channels named (D3DCLEAR_TARGET_R, _G, _B, _A):
+	the fog screen clears only alpha, leaving the picture under the fog */
+	if (flags & D3DCLEAR_TARGET_R)
+		channels |= D3D11_BACKEND_CLEAR_R;
+	if (flags & D3DCLEAR_TARGET_G)
+		channels |= D3D11_BACKEND_CLEAR_G;
+	if (flags & D3DCLEAR_TARGET_B)
+		channels |= D3D11_BACKEND_CLEAR_B;
+	if (flags & D3DCLEAR_TARGET_A)
+		channels |= D3D11_BACKEND_CLEAR_A;
+	if (has_depth && (flags & D3DCLEAR_ZBUFFER))
+		channels |= D3D11_BACKEND_CLEAR_DEPTH;
+	if (has_depth && (flags & D3DCLEAR_STENCIL))
+		channels |= D3D11_BACKEND_CLEAR_STENCIL;
+	if (!channels)
+		return;
+	/* the rectangles in the targets' pixels, row 0 at the top (Direct3D's
+	way up, so no flip) */
+	if (!count || !rectangles)
+	{
+		/* the NV2A clips a viewport-less clear to the viewport, which is what
+		keeps a split-screen window's clear from wiping the other window */
+		GLint x0 = target_pixel((float)device.viewport.X, 0);
+		GLint y0 = target_pixel((float)device.viewport.Y, 1);
+
+		pixels[0][0] = x0;
+		pixels[0][1] = y0;
+		pixels[0][2] = target_pixel((float)(device.viewport.X + device.viewport.Width), 0) - x0;
+		pixels[0][3] = target_pixel((float)(device.viewport.Y + device.viewport.Height), 1) - y0;
+		made = 1;
+	}
+	for (index = 0; rectangles && index < count; index++)
+	{
+		INT left = rectangles[index].x1 > device.viewport.X ? rectangles[index].x1 : device.viewport.X;
+		INT top = rectangles[index].y1 > device.viewport.Y ? rectangles[index].y1 : device.viewport.Y;
+		INT right = rectangles[index].x2 < device.viewport.X + device.viewport.Width ?
+			rectangles[index].x2 : device.viewport.X + device.viewport.Width;
+		INT bottom = rectangles[index].y2 < device.viewport.Y + device.viewport.Height ?
+			rectangles[index].y2 : device.viewport.Y + device.viewport.Height;
+		GLint x0, y0;
+
+		if (left >= right || top >= bottom)
+			continue;
+		x0 = target_pixel((float)(left + UI_OFFSET), 0);
+		y0 = target_pixel((float)top, 1);
+		pixels[made][0] = x0;
+		pixels[made][1] = y0;
+		pixels[made][2] = target_pixel((float)(right + UI_OFFSET), 0) - x0;
+		pixels[made][3] = target_pixel((float)bottom, 1) - y0;
+		/* (a clear of more rectangles than that goes in parts) */
+		if (++made == CLEAR_RECTANGLES)
+		{
+			result = d3d11_backend_clear(channels, rgba, z, stencil, &pixels[0][0], made);
+			stats.clears_by_calls += result == 1;
+			stats.clears_drawn += result == 2;
+			made = 0;
+		}
+	}
+	if (!made)
+		return;
+	result = d3d11_backend_clear(channels, rgba, z, stencil, &pixels[0][0], made);
+	stats.clears_by_calls += result == 1;
+	stats.clears_drawn += result == 2;
+	/* (the first clear that is drawn, said once: the statistics count them a
+	frame, and one now and then is lost in the average) */
+	if (result == 2 && !first_drawn_clear_logged)
+	{
+		first_drawn_clear_logged = TRUE;
+		platform_log("Direct3D 11: the first clear drawn, at frame %lu: flags %lx, colour %08lx, %lu rectangles, the "
+			"first %ldx%ld at %ld,%ld", device.frame, (unsigned long)flags, (unsigned long)color, (unsigned long)made,
+			(long)pixels[0][2], (long)pixels[0][3], (long)pixels[0][0], (long)pixels[0][1]);
+	}
 }
 
 /* ---------- the anti-aliasing passes */
@@ -1495,44 +1821,129 @@ void halo_screen_anti_alias(short x0, short y0, short x1, short y1)
 
 /* ---------- presentation */
 
+static void write_screenshot(struct render_target_entry *target)
+{
+	const char *directory = *config_string("debug.screenshot_directory") ?
+		config_string("debug.screenshot_directory") : NULL;
+	unsigned long width = target->target.gl_width, height = target->target.gl_height;
+	unsigned char *pixels;
+	char path[512];
+	FILE *file;
+	unsigned long row;
+	unsigned char header[54] = { 'B', 'M' };
+	unsigned long image_size = width * height * 4;
+
+	if (!directory)
+		return;
+	pixels = malloc(image_size);
+	/* (BGRA rows from the top, as the BMP below takes them) */
+	if (!pixels || !d3d11_backend_target_read(target->backend_target, pixels, image_size))
+	{
+		free(pixels);
+		return;
+	}
+	/* the display ignores destination alpha, which the game uses as scratch;
+	image viewers would show it as transparency */
+	for (row = 0; row < width * height; row++)
+	{
+		pixels[row * 4 + 3] = 0xff;
+	}
+	snprintf(path, sizeof(path), "%s/frame%05lu.bmp", directory, device.frame);
+	file = fopen(path, "wb");
+	if (file)
+	{
+		*(unsigned int *)(header + 2) = (unsigned int)(54 + image_size);
+		*(unsigned int *)(header + 10) = 54;
+		*(unsigned int *)(header + 14) = 40;
+		*(int *)(header + 18) = (int)width;
+		*(int *)(header + 22) = -(int)height; /* rows from the top, as read */
+		*(unsigned short *)(header + 26) = 1;
+		*(unsigned short *)(header + 28) = 32;
+		*(unsigned int *)(header + 34) = (unsigned int)image_size;
+		fwrite(header, 1, sizeof(header), file);
+		for (row = 0; row < height; row++)
+			fwrite(pixels + row * width * 4, 1, width * 4, file);
+		fclose(file);
+	}
+	free(pixels);
+}
+
 void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destination_rectangle,
 	void *unused, void *unused2)
 {
 	static long screenshot_every = -1;
+	int presented = 0;
 
 	(void)source_rectangle;
 	(void)destination_rectangle;
 	(void)unused;
 	(void)unused2;
 	if (screenshot_every < 0)
-	{
 		screenshot_every = config_integer("debug.screenshot_every");
-		if (screenshot_every > 0)
-			platform_log("debug.screenshot_every: no screenshots until the Direct3D 11 renderer presents (phase 2)");
-	}
 
+	/* display.vsync, the present's sync interval, and the marker, read again
+	when a setting changes (as frame_interval_ns reads them) */
+	if (device.backend_ready && device.settings_read_at != config_changes())
+	{
+		device.settings_read_at = config_changes();
+		device.vsync = config_boolean("display.vsync");
+		d3d11_backend_present_marker(config_boolean("debug.d3d11_present_marker"));
+	}
+	/* the back buffer, drawn letterboxed into the window and presented; its
+	target is made now if nothing was cleared into it yet, so a frame with no
+	clear presents black */
 	if (device.backend_ready)
+	{
+		struct render_target_entry *back_buffer = render_target_get(&device.back_buffer);
+		int window_width = 0, window_height = 0;
+
+		if (back_buffer && back_buffer->backend_target)
+		{
+			if (trace_frame())
+				platform_log("present back buffer %08lx target %lu", (unsigned long)device.back_buffer.Data,
+					(unsigned long)back_buffer->backend_target);
+			if (screenshot_every > 0 && device.frame % (unsigned long)screenshot_every == 0)
+				write_screenshot(back_buffer);
+			platform_video_drawable_size(&window_width, &window_height);
+			presented = d3d11_backend_present(back_buffer->backend_target,
+				(uint32_t)(window_width > 0 ? window_width : 0), (uint32_t)(window_height > 0 ? window_height : 0),
+				device.vsync ? 1 : 0);
+		}
 		stats.debug_messages += d3d11_backend_drain_debug();
-	/* the window presents nothing yet: in the platform layer's no-context
-	mode this paces the frame (display.vsync at the display's refresh,
-	display.max_fps as with OpenGL) */
-	if (device.window_ready)
+		backend_lost_check();
+	}
+	if (presented == 1)
+		stats.presented++;
+	else
+		stats.not_presented++;
+	/* with vsync, a presented frame was paced by the present's interval;
+	every other frame is paced by the platform layer (display.max_fps, or the
+	display's refresh with vsync) */
+	if (device.window_ready && (presented != 1 || !device.vsync))
 		platform_video_swap();
 	device.frame++;
 	stats.presents++;
 	if (debug_settings.statistics && device.frame % 60 == 0)
 	{
-		/* (draws a frame, as d3d8_gl.c's line has them; the stub calls since
-		the start, which phase 6 brings to 0; the layer's messages since the
-		last line, when debug.d3d11_debug asks for the layer) */
+		/* (draws, clears and target changes a frame, as d3d8_gl.c's line has
+		them; the targets alive; the presents and resizes since the last
+		line; the stub calls since the start, which phase 6 brings to 0; the
+		layer's messages since the last line, when debug.d3d11_debug asks for
+		the layer) */
 		char layer[64] = "";
+		uint32_t resizes = d3d11_backend_resizes();
 
 		if (config_boolean("debug.d3d11_debug"))
 			snprintf(layer, sizeof(layer), "; %lu debug layer messages", stats.debug_messages);
-		platform_log("frame %lu: Direct3D 11 draws nothing yet; %lu draws, %lu immediate, %lu clears asked for; "
+		platform_log("frame %lu: Direct3D 11 clears only; %lu draws, %lu immediate dropped; %lu clears (%lu by clear "
+			"calls, %lu drawn), %lu target changes, %lu targets; %lu presented, %lu not; %lu swap chain resizes; "
 			"%lu GL stub calls%s",
 			device.frame, stats.draws / stats.presents, stats.immediate_draws / stats.presents,
-			stats.clears / stats.presents, gl_stubs_calls() - device.gl_stub_calls_before, layer);
+			stats.clears / stats.presents, stats.clears_by_calls / stats.presents, stats.clears_drawn / stats.presents,
+			stats.target_changes / stats.presents, (unsigned long)d3d11_backend_targets_alive(), stats.presented,
+			stats.not_presented, (unsigned long)(resizes - device.resizes_before),
+			gl_stubs_calls() - device.gl_stub_calls_before, layer);
+		device.resizes_before = resizes;
 		memset(&stats, 0, sizeof(stats));
 	}
 	platform_pump_events();
