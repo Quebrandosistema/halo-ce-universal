@@ -602,6 +602,15 @@ static const struct config_setting config_settings[] =
 	{ "debug.d3d11_debug", _config_boolean, "false", "HALO_D3D11_DEBUG", _environment_set_is_true, _platform_windows,
 		"Direct3D 11 executable: the Direct3D debug layer's messages in the log\n"
 		"(needs the Graphics Tools feature of Windows)." },
+	{ "debug.d3d11_present_marker", _config_boolean, "false", "HALO_D3D11_PRESENT_MARKER", _environment_set_is_true,
+		_platform_windows,
+		"Direct3D 11 executable: a red square at the top left and a green one at the\n"
+		"top right of the picture, so that a screenshot shows which way up it is and\n"
+		"where its edges are." },
+	{ "debug.d3d11_self_test", _config_boolean, "false", "HALO_D3D11_SELF_TEST", _environment_set_is_true,
+		_platform_windows,
+		"Direct3D 11 executable: at start, the renderer tries its own clears (and,\n"
+		"from phase 3, its memory paths) and says in the log whether each is right." },
 #endif
 	{ "debug.menu_open", _config_string, "\"\"", "HALO_MENU_OPEN", _environment_value, _platform_all,
 		"Start on this screen of the menus (port/assets/menus) instead of the main\n"
