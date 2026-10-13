@@ -2,19 +2,22 @@
 
 This folder is for the Windows build's Direct3D 11 renderer, which is
 planned in [port/windows/D3D11.md](../D3D11.md). The renderer is in
-development (phase 1: the executable runs the game with a black window).
+development (phase 2: the window shows only the clears of the game).
 
 | File | Contents |
 | --- | --- |
-| `d3d8_d3d11.c` | The Direct3D 8 device of `halo_d3d11.exe`: a copy of `port/linux/src/d3d8_gl.c` without OpenGL. It keeps the state of the game and draws nothing yet. It uses the Xbox SDK declarations. |
-| `win32_d3d11.c` | The Direct3D 11 backend: the adapter, the device, the debug layer and the `renderer:` line of the log. It uses only the Windows SDK. |
+| `d3d8_d3d11.c` | The Direct3D 8 device of `halo_d3d11.exe`: a copy of `port/linux/src/d3d8_gl.c` without OpenGL. It keeps the state of the game, finds the render targets of the game, clears them and presents the back buffer. It does not draw yet. It uses the Xbox SDK declarations. |
+| `win32_d3d11.c` | The Direct3D 11 backend: the adapter, the device, the debug layer, the `renderer:` line of the log, the render targets, the clears, the built-in shaders, the read-back for screenshots, the self-test of the clears and the lost device. It uses only the Windows SDK. |
+| `win32_d3d11_present.c` | The swap chain on the window, its resize, the presentation of the back buffer (letterboxed) and the marker (`debug.d3d11_present_marker`). It uses only the Windows SDK. |
+| `win32_d3d11.h` | The state and the functions that the two backend files share. It uses only the Windows SDK. |
 | `d3d11_backend.h` | The functions of the backend that the device calls. It uses neither SDK. |
 | `win32_d3d11_probe.c` | The probe of phase 0 (below). |
 
 `ninja windows` builds `build\windows\halo_d3d11.exe` from these files
 (except the probe) and the other objects of `halo.exe`. Refer to
 [port/windows/README.md](../README.md) for its settings
-(`display.d3d11_adapter`, `debug.d3d11_debug`).
+(`display.d3d11_adapter`, `debug.d3d11_debug`, `debug.d3d11_present_marker`,
+`debug.d3d11_self_test`).
 
 ## The probe
 
