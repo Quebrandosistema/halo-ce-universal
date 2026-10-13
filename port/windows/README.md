@@ -63,8 +63,9 @@ renderer is in development: refer to [D3D11.md](D3D11.md). At this time the
 window shows only the clears of the game: the plain colours that the game
 fills its screen with before it draws. The renderer copies the vertices and
 the indices of each draw of the game into Direct3D buffers, and makes the
-shader key of each draw, but it does not draw them yet. The menus, the game, the sound and the input operate, but the
-executable draws nothing else. To play, use `halo.exe`.
+shader key of each draw, but it does not draw them yet. The menus, the
+game, the sound and the input operate, but the executable draws nothing
+else. To play, use `halo.exe`.
 
 The two executables use the same `config.toml`, the same game data and the
 same saved games. These settings apply only to `halo_d3d11.exe`:
