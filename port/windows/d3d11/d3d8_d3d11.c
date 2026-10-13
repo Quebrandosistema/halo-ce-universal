@@ -2294,8 +2294,10 @@ static void dump_manifest_line(const char *format, ...)
 	{
 		char path[512];
 
+		/* (appended: the runs of a corpus, the menus' and a map's, write
+		into one folder; a shader met again is written again, the same) */
 		snprintf(path, sizeof(path), "%s/manifest.txt", debug_settings.dump_shaders);
-		shaders_met.manifest = fopen(path, "w");
+		shaders_met.manifest = fopen(path, "a");
 		if (!shaders_met.manifest)
 		{
 			shaders_met.manifest_failed = TRUE;
