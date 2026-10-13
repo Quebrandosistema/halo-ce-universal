@@ -12,7 +12,8 @@ strings and plain pointers cross it, as in update.h and posix.h.
 Phase 1: the device, the adapter, the debug layer, the log line. Phase 2: the
 swap chain and the present, the render targets, the clears, the read-back,
 the clears' self-test, the lost device. Phase 3: the stream and index rings,
-the mirror's segments and their upload ring, the memory self-test.
+the mirror's segments and their upload ring, the memory self-test. Phase 4:
+a shader's compile, for the generator self-test.
 */
 
 #ifndef D3D11_BACKEND_H
@@ -160,5 +161,14 @@ bytes rewritten in place) and the index ring, each drawn into a target of
 the test's own after each write and read back. 1 if every draw had the colour
 its bytes had at the draw; line says so, or which case and draw differed. */
 int d3d11_backend_memory_self_test(char *line, size_t line_size);
+
+/* ---------- shaders (win32_d3d11.c) */
+
+/* HLSL compiled (d3dcompiler_47.dll, D3DCOMPILE_OPTIMIZATION_LEVEL3) and the
+bytecode let go: 1 if it compiles; 0 if not, or without the compiler, the
+compiler's messages logged with name. Phase 4's generator self-test; the
+backend keeps no shader of the game's yet (phase 5). */
+int d3d11_backend_shader_compiles(const char *source, size_t size, const char *name, const char *entry,
+	const char *target);
 
 #endif

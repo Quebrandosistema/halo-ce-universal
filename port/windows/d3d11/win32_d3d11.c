@@ -22,6 +22,9 @@ which the memory self-test's pipeline needs), and the targets' making,
 freeing and read-back with it; the memory unit (win32_d3d11_memory.c)
 released by destroy.
 
+Phase 4: d3d11_backend_shader_compiles, the compile the HLSL generators'
+self-test asks for (d3d8_d3d11.c).
+
 hr_text, drain_debug (as backend_drain_debug), choose_adapter and
 create_device are copied from phase 0's probe (win32_d3d11_probe.c), where they
 were tried on this machine's Adreno and on WARP, and changed only for what the
@@ -551,6 +554,16 @@ int d3d11_backend_compile(const char *source, size_t size, const char *name, con
 			messages ? (const char *)ID3D10Blob_GetBufferPointer(messages) : "");
 	release(&messages);
 	return SUCCEEDED(result);
+}
+
+int d3d11_backend_shader_compiles(const char *source, size_t size, const char *name, const char *entry,
+	const char *target)
+{
+	ID3DBlob *code = NULL;
+	int compiled = d3d11_backend_compile(source, size, name, entry, target, &code);
+
+	release(&code);
+	return compiled;
 }
 
 static int compile(const char *entry, const char *target, ID3DBlob **code)

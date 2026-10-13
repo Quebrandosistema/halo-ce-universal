@@ -44,6 +44,16 @@ does, a visibility test, reports 0 samples. The Direct3D 11 device is the backen
 window, which the platform layer makes without an OpenGL context
 (platform_video_without_gl). The GL calls the shared files still make go to
 counted stubs (build/windows/gl_stubs.c, tools/windows_gl_stubs.py).
+
+Phase 4 brought back prepare_draw's pixel shader key (pixel_key_make, with
+bind_textures' decisions and no GL) and vertex_shader_get's choice of a
+vertex shader (stream or immediate, lit or not), made at every draw past its
+guards (draw_note), kept in tables as fragment_shader_get's, and each first
+met dumped with debug.gpu_dump_shaders: its HLSL from the generators' copies
+(nv2a_vsh_hlsl.c, nv2a_psh_hlsl.c), its GLSL twin from the originals, the
+key's bytes and a manifest, for tools/d3d11_shader_check.py; and the
+generators' self-test (debug.d3d11_self_test's third line). Nothing is
+compiled at the draw yet (phase 5).
 */
 
 #include "xgpu.h"
@@ -51,12 +61,15 @@ counted stubs (build/windows/gl_stubs.c, tools/windows_gl_stubs.py).
 #include "sdl_platform.h"
 #include "halo_ui_pointer.h"
 #include "port_config.h"
+#include "hud_hires.h"
 #include "d3d11_backend.h"
+#include "hlsl_shaders.h"
 
 /* the GL calls counted by the stubs since the start (build/windows/gl_stubs.c) */
 unsigned long gl_stubs_calls(void);
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -305,6 +318,8 @@ struct vertex_element
 	unsigned short offset;
 };
 
+struct vertex_variant;
+
 struct vertex_shader_object
 {
 	unsigned long signature;
@@ -314,6 +329,17 @@ struct vertex_shader_object
 	struct vertex_element elements[XGPU_VERTEX_ATTRIBUTE_COUNT];
 	unsigned long element_count;
 	unsigned long packed_mask;
+	/* the declaration's attributes of signed 16-bit integers (D3DVSDT_SHORT1
+	to 4: DXGI has no format that makes them floats, so the shader converts
+	them), and of three components (D3DVSDT_SHORT3, NORMSHORT3, PBYTE3: no
+	DXGI format has three 16-bit or 8-bit components, so the layout reads
+	four and the shader makes w 1); with packed_mask, in the vertex shader's
+	identity (hlsl_shaders.h) */
+	unsigned long integer_mask;
+	unsigned long three_component_mask;
+	/* the program's vertex shaders as the draws met them, [lit][immediate]
+	(d3d8_gl.c's shader[] and lit_shader[]: vertex_variant_get) */
+	struct vertex_variant *variants[2][2];
 	/* one of the game's model lighting programs (halo_vertex_shader_lighting),
 	whose draws can be lit for each pixel (display.per_pixel_lighting): where
 	its lighting's normal and position are (lighting.lights is 0 for the
@@ -782,6 +808,8 @@ static BOOL bind_targets(BOOL *has_depth)
 
 /* ---------- device creation */
 
+static void shader_self_test(char *line, size_t line_size);
+
 /* what gl_initialize does that is not OpenGL, with the Direct3D 11 device in
 its place (port/windows/d3d11/win32_d3d11.c): the backend's one line goes to
 the log as it is, whatever it says, and without a device the game runs with
@@ -813,12 +841,15 @@ static void backend_initialize(void)
 		platform_log("%s", line);
 	}
 	/* debug.d3d11_self_test: the clears tried on the backend's own targets,
-	then the memory paths on its rings and a segment of its own */
+	then the memory paths on its rings and a segment of its own, then the
+	HLSL generators on synthetic shaders */
 	if (device.backend_ready && config_boolean("debug.d3d11_self_test"))
 	{
 		d3d11_backend_self_test(line, sizeof(line));
 		platform_log("%s", line);
 		d3d11_backend_memory_self_test(line, sizeof(line));
+		platform_log("%s", line);
+		shader_self_test(line, sizeof(line));
 		platform_log("%s", line);
 	}
 	/* the rings start full, so that the first write to each orphans it (a
@@ -1511,6 +1542,16 @@ static void parse_declaration(struct vertex_shader_object *object, const DWORD *
 				offsets[stream] += element->bytes;
 				if (element->type == D3DVSDT_NORMPACKED3)
 					object->packed_mask |= 1UL << element->reg;
+				if (element->type == D3DVSDT_SHORT1 || element->type == D3DVSDT_SHORT2 ||
+					element->type == D3DVSDT_SHORT3 || element->type == D3DVSDT_SHORT4)
+				{
+					object->integer_mask |= 1UL << element->reg;
+				}
+				if (element->type == D3DVSDT_SHORT3 || element->type == D3DVSDT_NORMSHORT3 ||
+					element->type == D3DVSDT_PBYTE3)
+				{
+					object->three_component_mask |= 1UL << element->reg;
+				}
 			}
 			break;
 		case D3DVSD_TOKEN_CONSTMEM:
@@ -2024,10 +2065,779 @@ static WORD *quad_indices(const WORD *indices, unsigned long count, unsigned lon
 	return result;
 }
 
+/* ---------- the shaders a draw would use (phase 4)
+
+Nothing is drawn yet (phase 6), and nothing is compiled at the draw (phase
+5), but at every draw the device makes the pixel shader key as d3d8_gl.c's
+prepare_draw makes it, and chooses the vertex shader's variant as it does,
+without GL and without binding anything; each first met is counted and, with
+debug.gpu_dump_shaders, dumped: its HLSL (nv2a_vsh_hlsl.c, nv2a_psh_hlsl.c),
+its GLSL twin from the unchanged generators (the OpenGL executable's text for
+the same shader), the key's bytes and a line of the manifest, which
+tools/d3d11_shader_check.py takes as its corpus. Phase 5 gives the entries
+their handles. */
+
+/* size is a multiple of 4 (d3d8_gl.c's) */
+static unsigned long hash_words(const void *data, unsigned long size)
+{
+	const DWORD *words = data;
+	unsigned long hash = 2166136261UL;
+
+	for (size /= 4; size; size--)
+		hash = (hash ^ *words++) * 16777619UL;
+	return hash;
+}
+
+typedef char pixel_shader_key_size_assert[sizeof(struct nv2a_pixel_shader_key) % 4 == 0 ? 1 : -1];
+
+/* FNV-1a, 64 bits: a shader's identity (phase 5's cache names its files by
+it) */
+#define SHADER_HASH_START 14695981039346656037ULL
+
+static uint64_t shader_hash(uint64_t hash, const void *data, size_t size)
+{
+	const unsigned char *bytes = data;
+	size_t index;
+
+	for (index = 0; index < size; index++)
+		hash = (hash ^ bytes[index]) * 1099511628211ULL;
+	return hash;
+}
+
+static unsigned long stage_texture_mode(int stage)
+{
+	return (D3D__RenderState[D3DRS_PSTEXTUREMODES] >> (5 * stage)) & 0x1f;
+}
+
+/* display.per_pixel_lighting: the model lighting programs' draws are lit for
+each pixel (nv2a_psh.c model_lighting), from shaders of their own; read
+again when a setting changes (d3d8_gl.c's) */
+static BOOL per_pixel_lighting(void)
+{
+	static unsigned long read_at = (unsigned long)-1;
+	static BOOL enabled;
+
+	if (read_at != config_changes())
+	{
+		read_at = config_changes();
+		enabled = config_boolean("display.per_pixel_lighting") != 0;
+	}
+	return enabled;
+}
+
+/* the render target with this physical address the game drew into last
+(d3d8_gl.c's xgpu_render_target_find, which is not exported here: the
+renderer's own table) */
+static struct render_target_entry *render_target_find(unsigned long data)
+{
+	struct render_target_entry *entry, *best = NULL;
+
+	for (entry = *render_target_bucket(data); entry; entry = entry->next_in_bucket)
+	{
+		if (entry->target.data == data && !entry->target.depth && (!best || entry->last_rendered > best->last_rendered))
+			best = entry;
+	}
+	return best;
+}
+
+/* bind_textures' decisions for the key, without GL (d3d8_gl.c): a stage with
+no texture, or in modes 0, 0x04, 0x05, has no sampler, and in mode 0x11 a 2D
+one; a render target the stage samples is 2D; otherwise the texture's own
+type, a cube map's a cube and a volume's 3D. Stage 0's coverage_alpha and
+point_threshold are its high-res HUD texture's (hud_hires.h), found as the
+texture cache finds it when it uploads the bitmap (xbox_textures.c), without
+the decode: the bitmap's address, sizes and first level's bytes, not
+palettized, not a cube map or a volume. */
+static void key_textures(struct nv2a_pixel_shader_key *key)
+{
+	int stage;
+
+	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
+	{
+		D3DBaseTexture *texture = device.textures[stage];
+		unsigned long mode = stage_texture_mode(stage);
+		struct xgpu_texture_description description;
+
+		if (!texture || !texture->Data || mode == 0 || mode == 0x04 || mode == 0x05 || mode == 0x11)
+		{
+			key->sampler_type[stage] = mode == 0x11 ? _xgpu_sampler_2d : _xgpu_sampler_none;
+			continue;
+		}
+		/* (a render target: its description's high-res flags are clear) */
+		if (render_target_find(texture->Data))
+		{
+			key->sampler_type[stage] = _xgpu_sampler_2d;
+			continue;
+		}
+		xgpu_texture_describe(texture->Format, texture->Size, &description);
+		if (stage == 0 && ((texture->Format & D3DFORMAT_FORMAT_MASK) >> D3DFORMAT_FORMAT_SHIFT) != 0x0b &&
+			!description.cube_map && description.depth == 1)
+		{
+			long override = hud_hires_override_find((unsigned long)PLATFORM_PHYSICAL_TO_VIRTUAL(texture->Data),
+				description.width, description.height, description.levels > 1 ?
+				xgpu_texture_level_offset(&description, 1) : xgpu_texture_face_size(&description));
+
+			key->coverage_alpha = override >= 0 && hud_hires_override_coverage(override);
+			key->point_threshold = override >= 0 && hud_hires_override_point_threshold(override);
+		}
+		key->sampler_type[stage] = description.cube_map ? _xgpu_sampler_cube :
+			description.depth > 1 ? _xgpu_sampler_3d : _xgpu_sampler_2d;
+	}
+}
+
+/* prepare_draw's key (d3d8_gl.c), without GL: alpha_test_samples stays 0
+(the target's samples are phase 6's) and count_samples 0 (the visibility
+tests are occlusion queries, phase 6) */
+static void pixel_key_make(struct nv2a_pixel_shader_key *key)
+{
+	int stage;
+
+	/* (zeroed first, so that the padding hashes the same) */
+	memset(key, 0, sizeof(*key));
+	memcpy(key->combiner_state, D3D__RenderState, sizeof(key->combiner_state));
+	/* constants are uniforms, not part of the program */
+	memset(&key->combiner_state[D3DRS_PSCONSTANT0_0], 0, 16 * sizeof(DWORD));
+	key->combiner_state[D3DRS_PSFINALCOMBINERCONSTANT0] = 0;
+	key->combiner_state[D3DRS_PSFINALCOMBINERCONSTANT1] = 0;
+	key->texture_modes = D3D__RenderState[D3DRS_PSTEXTUREMODES];
+	key_textures(key);
+	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
+	{
+		key->alpha_kill[stage] = D3D__TextureState[stage][D3DTSS_ALPHAKILL] == D3DTALPHAKILL_ENABLE;
+		key->color_sign[stage] = (unsigned char)((D3D__TextureState[stage][D3DTSS_COLORSIGN] >> 28) & 0xf);
+	}
+	/* (only with the meter's blend: hud_hires.h, nv2a_pixel_shader_key) */
+	key->coverage_alpha = key->coverage_alpha && D3D__RenderState[D3DRS_ALPHABLENDENABLE] &&
+		D3D__RenderState[D3DRS_SRCBLEND] == D3DBLEND_CONSTANTCOLOR &&
+		D3D__RenderState[D3DRS_DESTBLEND] == D3DBLEND_SRCALPHA;
+	key->point_threshold = key->point_threshold && key->coverage_alpha;
+	key->alpha_test_function = D3D__RenderState[D3DRS_ALPHATESTENABLE] ? D3D__RenderState[D3DRS_ALPHAFUNC] : 0;
+	key->fog_enable = D3D__RenderState[D3DRS_FOGENABLE] != 0;
+	key->fog_table_mode = (unsigned char)D3D__RenderState[D3DRS_FOGTABLEMODE];
+}
+
+/* a pixel shader the draws met, by its key (d3d8_gl.c's fragment_entry);
+phase 5 gives it its handle */
+struct pixel_entry
+{
+	struct pixel_entry *next;
+	unsigned long hash;
+	struct nv2a_pixel_shader_key key;
+	uint64_t identity;
+	uint32_t handle;
+};
+
+/* a vertex shader variant the draws met: the program's words, the
+declaration's three masks (0 for immediate mode) and lit (vertex_shader_get's
+choice, d3d8_gl.c), phase 5 its handle */
+struct vertex_variant
+{
+	struct vertex_variant *next;
+	uint64_t identity;
+	const struct vertex_shader_object *program;
+	uint32_t packed_mask, integer_mask, three_component_mask;
+	BOOL lit;
+	uint32_t handle;
+};
+
+#define PIXEL_BUCKETS 1024
+#define VERTEX_VARIANT_BUCKETS 1024
+
+static struct pixel_entry *pixel_buckets[PIXEL_BUCKETS];
+static struct vertex_variant *vertex_variant_buckets[VERTEX_VARIANT_BUCKETS];
+
+/* met since the start, and dumped (debug.gpu_dump_shaders), and dumped when
+the log last said */
+static struct
+{
+	unsigned long pixel_keys, vertex_variants;
+	unsigned long vertex_dumped, pixel_dumped;
+	unsigned long vertex_dumped_said, pixel_dumped_said;
+	FILE *manifest;
+	BOOL manifest_failed;
+} shaders_met;
+
+/* a pixel shader's identity: the generator's version and the key's bytes */
+static uint64_t pixel_identity(const struct nv2a_pixel_shader_key *key)
+{
+	uint32_t version = HLSL_SHADER_GENERATOR_VERSION;
+
+	return shader_hash(shader_hash(SHADER_HASH_START, &version, sizeof(version)), key, sizeof(*key));
+}
+
+/* a vertex shader's: the generator's version, the program's words, the three
+masks and lit */
+static uint64_t vertex_identity(const struct vertex_shader_object *program, uint32_t packed_mask,
+	uint32_t integer_mask, uint32_t three_component_mask, BOOL lit)
+{
+	uint32_t words[6];
+
+	words[0] = HLSL_SHADER_GENERATOR_VERSION;
+	words[1] = (uint32_t)program->instruction_count;
+	words[2] = packed_mask;
+	words[3] = integer_mask;
+	words[4] = three_component_mask;
+	words[5] = lit ? (uint32_t)program->lighting.lights : 0;
+	return shader_hash(shader_hash(SHADER_HASH_START, words, sizeof(words)), program->instructions,
+		program->instruction_count * 4 * sizeof(DWORD));
+}
+
+/* ---------- the dump (debug.gpu_dump_shaders) */
+
+static void dump_manifest_line(const char *format, ...) __attribute__((format(printf, 1, 2)));
+
+static void dump_manifest_line(const char *format, ...)
+{
+	va_list arguments;
+
+	if (!shaders_met.manifest && !shaders_met.manifest_failed)
+	{
+		char path[512];
+
+		snprintf(path, sizeof(path), "%s/manifest.txt", debug_settings.dump_shaders);
+		shaders_met.manifest = fopen(path, "w");
+		if (!shaders_met.manifest)
+		{
+			shaders_met.manifest_failed = TRUE;
+			platform_log("shader dump: cannot write %s", path);
+		}
+	}
+	if (!shaders_met.manifest)
+		return;
+	va_start(arguments, format);
+	vfprintf(shaders_met.manifest, format, arguments);
+	va_end(arguments);
+	fputc('\n', shaders_met.manifest);
+	fflush(shaders_met.manifest);
+}
+
+/* a file of the dump; text files are written as d3d8_gl.c writes its dump
+("w"), so a GLSL twin is the OpenGL executable's file byte for byte */
+static BOOL dump_file(const char *name, const void *data, size_t size, BOOL text)
+{
+	char path[512];
+	FILE *file;
+
+	snprintf(path, sizeof(path), "%s/%s", debug_settings.dump_shaders, name);
+	if ((file = fopen(path, text ? "w" : "wb")) == NULL)
+	{
+		platform_log("shader dump: cannot write %s", path);
+		return FALSE;
+	}
+	fwrite(data, 1, size, file);
+	fclose(file);
+	return TRUE;
+}
+
+static void dump_vertex_variant(const struct vertex_variant *variant, BOOL immediate)
+{
+	const struct vertex_shader_object *program = variant->program;
+	char name[64], gl_name[64];
+	char *text;
+
+	snprintf(name, sizeof(name), "vs%016llx", (unsigned long long)variant->identity);
+	/* (d3d8_gl.c's vertex_shader_get names its dump so) */
+	snprintf(gl_name, sizeof(gl_name), "vs%03lu_%d%s.glsl", program->id, immediate ? 1 : 0, variant->lit ? "_lit" : "");
+	text = nv2a_hlsl_vertex_shader((const uint32_t *)program->instructions, (uint32_t)program->instruction_count,
+		variant->packed_mask, variant->integer_mask, variant->three_component_mask,
+		variant->lit ? &program->lighting : NULL);
+	if (text)
+	{
+		char file[80];
+
+		snprintf(file, sizeof(file), "%s.hlsl", name);
+		if (dump_file(file, text, strlen(text), TRUE))
+		{
+			dump_manifest_line("%s stage=vertex entry=%s target=%s packed=%04lx integer=%04lx three=%04lx lit=%d "
+				"program=%lu instructions=%lu gl=%s", file, HLSL_ENTRY, HLSL_VERTEX_TARGET,
+				(unsigned long)variant->packed_mask, (unsigned long)variant->integer_mask,
+				(unsigned long)variant->three_component_mask, variant->lit ? program->lighting.lights : 0, program->id,
+				program->instruction_count, gl_name);
+		}
+		free(text);
+	}
+	/* the twin: vertex_shader_get's call (d3d8_gl.c), the mask the packed
+	one, the lighting the same */
+	text = nv2a_vertex_shader_to_glsl(program->instructions, program->instruction_count, variant->packed_mask,
+		variant->lit ? &program->lighting : NULL);
+	if (text)
+	{
+		char file[80];
+
+		snprintf(file, sizeof(file), "%s.glsl", name);
+		if (dump_file(file, text, strlen(text), TRUE))
+			dump_manifest_line("%s stage=vertex twin=%s.hlsl", file, name);
+		free(text);
+	}
+	shaders_met.vertex_dumped++;
+}
+
+static void dump_pixel_entry(const struct pixel_entry *entry)
+{
+	char name[64], file[80], target[8];
+	char *text;
+
+	snprintf(name, sizeof(name), "ps%016llx", (unsigned long long)entry->identity);
+	text = nv2a_hlsl_pixel_shader(&entry->key, target);
+	if (text)
+	{
+		snprintf(file, sizeof(file), "%s.hlsl", name);
+		if (dump_file(file, text, strlen(text), TRUE))
+		{
+			/* (d3d8_gl.c's fragment_shader_get names its dump by the key's
+			hash_words) */
+			dump_manifest_line("%s stage=pixel entry=%s target=%s program=%lu gl=ps_%08lx.glsl", file, HLSL_ENTRY,
+				target, current_program() ? current_program()->id : 0, entry->hash);
+		}
+		free(text);
+	}
+	/* the twin: fragment_shader_get's call (d3d8_gl.c) */
+	text = nv2a_pixel_shader_to_glsl(&entry->key);
+	if (text)
+	{
+		snprintf(file, sizeof(file), "%s.glsl", name);
+		if (dump_file(file, text, strlen(text), TRUE))
+			dump_manifest_line("%s stage=pixel twin=%s.hlsl", file, name);
+		free(text);
+	}
+	snprintf(file, sizeof(file), "%s.key", name);
+	if (dump_file(file, &entry->key, sizeof(entry->key), FALSE))
+		dump_manifest_line("%s stage=pixel key=%s.hlsl bytes=%lu", file, name, (unsigned long)sizeof(entry->key));
+	shaders_met.pixel_dumped++;
+}
+
+/* the entry of a draw's pixel shader key (d3d8_gl.c's fragment_shader_get:
+the four met last, then the buckets by hash_words), made the first time */
+static struct pixel_entry *pixel_entry_get(const struct nv2a_pixel_shader_key *key)
+{
+	/* consecutive draws mostly use one of a few pixel shaders (an object's
+	parts take turns) */
+#define RECENT_PIXEL_COUNT 4
+	static struct pixel_entry *recent[RECENT_PIXEL_COUNT];
+	static unsigned long recent_next;
+	unsigned long hash, index;
+	struct pixel_entry **bucket;
+	struct pixel_entry *entry;
+
+	for (index = 0; index < RECENT_PIXEL_COUNT; index++)
+	{
+		if (recent[index] && words_equal(&recent[index]->key, key, sizeof(*key)))
+			return recent[index];
+	}
+	hash = hash_words(key, sizeof(*key));
+	bucket = &pixel_buckets[hash % PIXEL_BUCKETS];
+	for (entry = *bucket; entry; entry = entry->next)
+	{
+		if (entry->hash == hash && words_equal(&entry->key, key, sizeof(*key)))
+		{
+			recent[recent_next++ % RECENT_PIXEL_COUNT] = entry;
+			return entry;
+		}
+	}
+	entry = calloc(1, sizeof(*entry));
+	if (!entry)
+		return NULL;
+	entry->hash = hash;
+	entry->key = *key;
+	entry->identity = pixel_identity(key);
+	entry->next = *bucket;
+	*bucket = entry;
+	recent[recent_next++ % RECENT_PIXEL_COUNT] = entry;
+	shaders_met.pixel_keys++;
+	if (debug_settings.dump_shaders)
+		dump_pixel_entry(entry);
+	return entry;
+}
+
+/* the entry of a draw's vertex shader (d3d8_gl.c's vertex_shader_get): the
+program's variants as its shader[] and lit_shader[] were, stream or
+immediate, lit or not, remembered on the program for the declaration's masks
+they were met with; else found in the table by identity, or made */
+static struct vertex_variant *vertex_variant_get(struct vertex_shader_object *program, BOOL immediate, BOOL lit)
+{
+	struct vertex_variant **remembered = &program->variants[lit ? 1 : 0][immediate ? 1 : 0];
+	uint32_t packed_mask = immediate ? 0 : (uint32_t)device.vertex_shader->packed_mask;
+	uint32_t integer_mask = immediate ? 0 : (uint32_t)device.vertex_shader->integer_mask;
+	uint32_t three_component_mask = immediate ? 0 : (uint32_t)device.vertex_shader->three_component_mask;
+	struct vertex_variant **bucket;
+	struct vertex_variant *variant;
+	uint64_t identity;
+
+	variant = *remembered;
+	if (variant && variant->packed_mask == packed_mask && variant->integer_mask == integer_mask &&
+		variant->three_component_mask == three_component_mask)
+	{
+		return variant;
+	}
+	identity = vertex_identity(program, packed_mask, integer_mask, three_component_mask, lit);
+	bucket = &vertex_variant_buckets[identity % VERTEX_VARIANT_BUCKETS];
+	for (variant = *bucket; variant; variant = variant->next)
+	{
+		/* (the same words, masks and lighting: the same shader, whichever
+		object holds the program) */
+		if (variant->identity == identity && variant->packed_mask == packed_mask &&
+			variant->integer_mask == integer_mask && variant->three_component_mask == three_component_mask &&
+			variant->lit == lit && variant->program->instruction_count == program->instruction_count &&
+			!memcmp(variant->program->instructions, program->instructions,
+				program->instruction_count * 4 * sizeof(DWORD)) &&
+			(!lit || !memcmp(&variant->program->lighting, &program->lighting, sizeof(program->lighting))))
+		{
+			*remembered = variant;
+			return variant;
+		}
+	}
+	variant = calloc(1, sizeof(*variant));
+	if (!variant)
+		return NULL;
+	variant->identity = identity;
+	variant->program = program;
+	variant->packed_mask = packed_mask;
+	variant->integer_mask = integer_mask;
+	variant->three_component_mask = three_component_mask;
+	variant->lit = lit;
+	variant->next = *bucket;
+	*bucket = variant;
+	*remembered = variant;
+	shaders_met.vertex_variants++;
+	if (debug_settings.dump_shaders)
+		dump_vertex_variant(variant, immediate);
+	return variant;
+}
+
+/* a draw past draw_ready: its key and its vertex shader's variant, as
+prepare_draw chooses them (a lit vertex shader that fails is phase 5's: here
+lighting_failed stays FALSE) */
+static void draw_note(BOOL immediate)
+{
+	struct vertex_shader_object *program = current_program();
+	struct nv2a_pixel_shader_key key;
+	BOOL lit;
+
+	pixel_key_make(&key);
+	lit = program->lighting.lights && !program->lighting_failed && per_pixel_lighting();
+	if (lit)
+		key.per_pixel_lighting = (unsigned char)program->lighting.lights;
+	vertex_variant_get(program, immediate, lit);
+	pixel_entry_get(&key);
+}
+
+/* the dump's line, every 600 frames when more came */
+static void dump_say(void)
+{
+	if (!debug_settings.dump_shaders || device.frame % 600 ||
+		(shaders_met.vertex_dumped == shaders_met.vertex_dumped_said &&
+		shaders_met.pixel_dumped == shaders_met.pixel_dumped_said))
+	{
+		return;
+	}
+	shaders_met.vertex_dumped_said = shaders_met.vertex_dumped;
+	shaders_met.pixel_dumped_said = shaders_met.pixel_dumped;
+	platform_log("shader dump: %lu vertex shaders and %lu pixel shaders written", shaders_met.vertex_dumped,
+		shaders_met.pixel_dumped);
+}
+
+/* ---------- the generator self-test (debug.d3d11_self_test, third line)
+
+Synthetic shaders for what the game's corpus lacks or has little of (fog,
+colour sign, alpha kill on stages 1 to 3, the texture modes and sampler
+types, the point threshold, the combiners' mappings, the alpha tests, the
+multisampled alpha test's SV_Coverage at ps_4_1, the lit pair with one and
+two lights, every mask bit of a vertex shader, every operation), each
+generated and compiled by the backend (d3d11_backend_shader_compiles). */
+
+struct self_test
+{
+	int count, failed;
+	char failures[256];
+};
+
+static void self_test_result(struct self_test *test, const char *name, BOOL ok)
+{
+	test->count++;
+	if (ok)
+		return;
+	test->failed++;
+	if (strlen(test->failures) + strlen(name) + 3 < sizeof(test->failures))
+	{
+		if (*test->failures)
+			strcat(test->failures, ", ");
+		strcat(test->failures, name);
+	}
+}
+
+static void self_test_pixel(struct self_test *test, const struct nv2a_pixel_shader_key *key, const char *name,
+	const char *wanted_target)
+{
+	char target[8];
+	char *text = nv2a_hlsl_pixel_shader(key, target);
+	BOOL ok = text && !strcmp(target, wanted_target) &&
+		d3d11_backend_shader_compiles(text, strlen(text), name, HLSL_ENTRY, target);
+
+	if (text && strcmp(target, wanted_target))
+		platform_log("d3d11: shader self-test: %s is for %s, not %s", name, target, wanted_target);
+	free(text);
+	self_test_result(test, name, ok);
+}
+
+static void self_test_vertex(struct self_test *test, const uint32_t *instructions, uint32_t count, uint32_t packed,
+	uint32_t integer, uint32_t three, const struct nv2a_vertex_lighting *lighting, const char *name)
+{
+	char *text = nv2a_hlsl_vertex_shader(instructions, count, packed, integer, three, lighting);
+	BOOL ok = text && d3d11_backend_shader_compiles(text, strlen(text), name, HLSL_ENTRY, HLSL_VERTEX_TARGET);
+
+	free(text);
+	self_test_result(test, name, ok);
+}
+
+/* a texture mode for each stage (nv2a_psh.c's _mode_*) */
+static DWORD self_test_modes(int stage0, int stage1, int stage2, int stage3)
+{
+	return (DWORD)(stage0 | stage1 << 5 | stage2 << 10 | stage3 << 15);
+}
+
+/* a key that reads every register in its one combiner stage and its final
+combiner: t0 to t3, v0, v1, fog, r0, r1, c0, c1 */
+static void self_test_key(struct nv2a_pixel_shader_key *key, DWORD modes, int sampler0, int sampler1, int sampler2,
+	int sampler3)
+{
+	DWORD *state = key->combiner_state;
+
+	memset(key, 0, sizeof(*key));
+	key->texture_modes = modes;
+	key->sampler_type[0] = (unsigned char)sampler0;
+	key->sampler_type[1] = (unsigned char)sampler1;
+	key->sampler_type[2] = (unsigned char)sampler2;
+	key->sampler_type[3] = (unsigned char)sampler3;
+	state[D3DRS_PSCOMBINERCOUNT] = 1;
+	/* stage 0: A t0, B t1, C t2, D t3 (rgb); A v0, B fog, C c0, D r0
+	(alpha); AB to r0, CD to r1, sum to v1 */
+	state[D3DRS_PSRGBINPUTS0] = 0x08090a0b;
+	state[D3DRS_PSALPHAINPUTS0] = 0x1413111c;
+	state[D3DRS_PSRGBOUTPUTS0] = 0x5cd;
+	state[D3DRS_PSALPHAOUTPUTS0] = 0x5cd;
+	/* the final combiner: A r0, B v1, C c1, D the EF product; E t0, F t1, G
+	r1's alpha */
+	state[D3DRS_PSFINALCOMBINERINPUTSABCD] = 0x0c05020f;
+	state[D3DRS_PSFINALCOMBINERINPUTSEFG] = 0x08091d00;
+	state[D3DRS_PSDOTMAPPING] = 0x321;
+	state[D3DRS_PSINPUTTEXTURE] = (1 << 16) | (2 << 20);
+}
+
+/* a vertex program instruction (nv2a_vsh.c's fields): the operations, the
+three operands by register file (1 temporary, 2 input, 3 constant) and
+index, the input register and constant they share, the masks and the
+destinations; every swizzle xyzw */
+static void self_test_instruction(uint32_t *words, unsigned mac, unsigned ilu, unsigned a_mux, unsigned a_index,
+	unsigned c_mux, unsigned c_index, unsigned input, unsigned constant, unsigned mac_mask, unsigned temporary,
+	unsigned ilu_mask, unsigned output_mask, unsigned output_address, unsigned from_ilu, unsigned relative)
+{
+	/* (B is the constant, or temporary 3 when A is a constant) */
+	unsigned b_mux = a_mux == 3 ? 1 : 3, b_index = 3;
+
+	words[0] = 0;
+	words[1] = ilu << 25 | mac << 21 | constant << 13 | input << 9 | 0x1b;
+	words[2] = a_index << 28 | a_mux << 26 | 0x1bu << 17 | b_index << 13 | b_mux << 11 | 0x1bu << 2 |
+		((c_index >> 2) & 3);
+	words[3] = (c_index & 3) << 30 | c_mux << 28 | mac_mask << 24 | temporary << 20 | ilu_mask << 16 |
+		output_mask << 12 | (output_mask ? 1u << 11 : 0) | output_address << 3 | from_ilu << 2 | relative << 1;
+}
+
+#define SELF_TEST_INSTRUCTIONS 48
+
+/* a short program: every input added into r2, every MAC operation into r4 to
+r11 and out to every output register, arl and a relative constant, every ILU
+operation (rcc of r12.w, which keeps the clip position), one with both units
+running, then the end */
+static uint32_t self_test_program(uint32_t words[SELF_TEST_INSTRUCTIONS][4])
+{
+	static const unsigned macs[] = { 2, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+	static const unsigned outputs[] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+	static const unsigned ilus[] = { 1, 2, 4, 5, 6, 7 };
+	uint32_t count = 0;
+	unsigned index;
+
+	/* r2 += v0 ... v15 */
+	for (index = 0; index < 16; index++)
+		self_test_instruction(words[count++], 3, 0, 2, 0, 1, 2, index, 0, 0xf, 2, 0, 0, 0, 0, 0);
+	/* oPos = r2 */
+	self_test_instruction(words[count++], 1, 0, 1, 2, 1, 2, 0, 0, 0, 0, 0, 0xf, 0, 0, 0);
+	/* mul, mad, dp3, dph, dp4, dst, min, max, slt, sge: r4 to r11 (r12:
+	oPos), out to oD0 ... oT3 */
+	for (index = 0; index < sizeof(macs) / sizeof(macs[0]); index++)
+	{
+		self_test_instruction(words[count++], macs[index], 0, 1, 2, 1, 2 + index % 3, 0, 5 + index, 0xf,
+			4 + index % 8, 0, 0xf, outputs[index], 0, 0);
+	}
+	/* arl a0 = r2.x; r5 = c[a0 + 7] */
+	self_test_instruction(words[count++], 13, 0, 1, 2, 1, 2, 0, 0, 0x8, 0, 0, 0, 0, 0, 0);
+	self_test_instruction(words[count++], 1, 0, 3, 0, 1, 2, 0, 7, 0xf, 5, 0, 0, 0, 0, 1);
+	/* rcc of r12.w (the screen conversion's), then mov, rcp, rsq, exp,
+	log, lit of r4 into r6, out to oT0 from the ILU */
+	self_test_instruction(words[count++], 0, 3, 1, 2, 1, 12, 0, 0, 0, 1, 0x1, 0, 0, 0, 0);
+	for (index = 0; index < sizeof(ilus) / sizeof(ilus[0]); index++)
+		self_test_instruction(words[count++], 0, ilus[index], 1, 2, 1, 4, 0, 0, 0, 6, 0xf, 0xf, 9, 1, 0);
+	/* both units: mad into r7, rsq into r1 */
+	self_test_instruction(words[count++], 4, 4, 1, 2, 1, 4, 0, 9, 0xf, 7, 0x8, 0xf, 10, 0, 0);
+	/* the end */
+	self_test_instruction(words[count++], 1, 0, 1, 7, 1, 7, 0, 0, 0, 0, 0, 0xf, 12, 0, 0);
+	words[count - 1][3] |= 1;
+	return count;
+}
+
+static void shader_self_test(char *line, size_t line_size)
+{
+	static const struct
+	{
+		DWORD function;
+		const char *name;
+	} alpha_tests[] =
+	{
+		{ D3DCMP_NEVER, "the alpha test never" }, { D3DCMP_LESS, "the alpha test less" },
+		{ D3DCMP_EQUAL, "the alpha test equal" }, { D3DCMP_LESSEQUAL, "the alpha test less or equal" },
+		{ D3DCMP_GREATER, "the alpha test greater" }, { D3DCMP_NOTEQUAL, "the alpha test not equal" },
+		{ D3DCMP_GREATEREQUAL, "the alpha test greater or equal" }, { D3DCMP_ALWAYS, "the alpha test always" },
+	};
+	static const struct
+	{
+		int modes[4];
+		int samplers[4];
+		const char *name;
+	} texture_cases[] =
+	{
+		/* project2d, bump environment, with luminance, dependent AR */
+		{ { 0x01, 0x06, 0x07, 0x0f }, { 1, 1, 1, 1 }, "the bump and dependent modes" },
+		/* dependent GB, clip plane, pass-through */
+		{ { 0x01, 0x10, 0x05, 0x04 }, { 1, 1, 0, 0 }, "dependent GB, clip plane and pass-through" },
+		/* dot product, dot ST, dot ZW */
+		{ { 0x04, 0x11, 0x09, 0x0a }, { 0, 1, 1, 0 }, "dot ST and dot ZW" },
+		/* dot reflect diffuse, then specular */
+		{ { 0x01, 0x11, 0x0b, 0x0c }, { 1, 1, 3, 3 }, "dot reflect diffuse and specular" },
+		{ { 0x01, 0x11, 0x11, 0x0d }, { 1, 1, 1, 2 }, "dot STR into a volume" },
+		{ { 0x01, 0x11, 0x11, 0x0e }, { 1, 1, 1, 3 }, "dot STR into a cube" },
+		{ { 0x01, 0x11, 0x11, 0x12 }, { 1, 1, 1, 3 }, "dot reflect specular constant" },
+		/* a cube map, a volume (project3d), BRDF (the default) */
+		{ { 0x03, 0x02, 0x08, 0x00 }, { 3, 2, 1, 0 }, "a cube map, a volume and BRDF" },
+	};
+	static const DWORD fog_modes[] = { D3DFOG_NONE, D3DFOG_EXP, D3DFOG_EXP2, D3DFOG_LINEAR };
+	static const char *const fog_names[] = { "fog by the vertex", "fog exp", "fog exp2", "fog linear" };
+	uint32_t program[SELF_TEST_INSTRUCTIONS][4];
+	struct nv2a_pixel_shader_key key;
+	struct nv2a_vertex_lighting lighting;
+	struct self_test test;
+	uint32_t count;
+	int index, stage;
+
+	memset(&test, 0, sizeof(test));
+	/* fog, in each table mode, into the combiner's fog register */
+	for (index = 0; index < 4; index++)
+	{
+		self_test_key(&key, self_test_modes(1, 1, 1, 1), 1, 1, 1, 1);
+		key.fog_enable = 1;
+		key.fog_table_mode = (unsigned char)fog_modes[index];
+		self_test_pixel(&test, &key, fog_names[index], HLSL_PIXEL_TARGET);
+	}
+	/* colour sign and alpha kill on every stage */
+	self_test_key(&key, self_test_modes(1, 1, 1, 1), 1, 1, 1, 1);
+	for (stage = 0; stage < 4; stage++)
+		key.color_sign[stage] = (unsigned char)(stage == 3 ? 0xf : 1 << stage);
+	self_test_pixel(&test, &key, "colour sign", HLSL_PIXEL_TARGET);
+	self_test_key(&key, self_test_modes(1, 1, 1, 1), 1, 1, 1, 1);
+	for (stage = 0; stage < 4; stage++)
+		key.alpha_kill[stage] = 1;
+	self_test_pixel(&test, &key, "alpha kill on every stage", HLSL_PIXEL_TARGET);
+	/* the texture modes, each sampler type */
+	for (index = 0; index < (int)(sizeof(texture_cases) / sizeof(texture_cases[0])); index++)
+	{
+		self_test_key(&key, self_test_modes(texture_cases[index].modes[0], texture_cases[index].modes[1],
+			texture_cases[index].modes[2], texture_cases[index].modes[3]), texture_cases[index].samplers[0],
+			texture_cases[index].samplers[1], texture_cases[index].samplers[2], texture_cases[index].samplers[3]);
+		self_test_pixel(&test, &key, texture_cases[index].name, HLSL_PIXEL_TARGET);
+	}
+	/* the high-res meters' coverage and point threshold */
+	self_test_key(&key, self_test_modes(1, 0, 0, 0), 1, 0, 0, 0);
+	key.coverage_alpha = 1;
+	key.point_threshold = 1;
+	self_test_pixel(&test, &key, "the point threshold", HLSL_PIXEL_TARGET);
+	/* eight combiner stages: every input mapping, the dot products, the mux
+	both ways, every output mapping, the blue into alpha, unique constants */
+	self_test_key(&key, self_test_modes(1, 1, 1, 1), 1, 1, 1, 1);
+	key.combiner_state[D3DRS_PSCOMBINERCOUNT] = 8 | 0x1000 | 0x10000;
+	for (stage = 0; stage < 8; stage++)
+	{
+		DWORD mapping = (DWORD)(stage << 5);
+
+		key.combiner_state[D3DRS_PSRGBINPUTS0 + stage] = (0x08 | mapping) << 24 | (0x19 | mapping) << 16 |
+			(0x0c | mapping) << 8 | (0x01 | mapping);
+		key.combiner_state[D3DRS_PSALPHAINPUTS0 + stage] = (0x1c | mapping) << 24 | (0x12 | mapping) << 16 |
+			(0x14 | mapping) << 8 | (0x1d | mapping);
+		key.combiner_state[D3DRS_PSRGBOUTPUTS0 + stage] = (DWORD)(((stage & 1 ? 0x83 : 0x44) | (stage % 7) << 3) << 12) |
+			0xc0d;
+		key.combiner_state[D3DRS_PSALPHAOUTPUTS0 + stage] = (DWORD)(((stage % 7) << 3 | 0x04) << 12) | 0xdc0;
+	}
+	key.combiner_state[D3DRS_PSFINALCOMBINERINPUTSEFG] = 0x08091de0;
+	self_test_pixel(&test, &key, "the combiners", HLSL_PIXEL_TARGET);
+	key.combiner_state[D3DRS_PSCOMBINERCOUNT] = 8 | 0x100;
+	self_test_pixel(&test, &key, "the combiners' other mux", HLSL_PIXEL_TARGET);
+	/* every alpha test, then multisampled: SV_Coverage, at ps_4_1, where it
+	compares by order */
+	for (index = 0; index < (int)(sizeof(alpha_tests) / sizeof(alpha_tests[0])); index++)
+	{
+		self_test_key(&key, self_test_modes(1, 1, 1, 1), 1, 1, 1, 1);
+		key.alpha_test_function = alpha_tests[index].function;
+		self_test_pixel(&test, &key, alpha_tests[index].name, HLSL_PIXEL_TARGET);
+	}
+	self_test_key(&key, self_test_modes(1, 1, 1, 1), 1, 1, 1, 1);
+	key.alpha_test_function = D3DCMP_GREATEREQUAL;
+	key.alpha_test_samples = 4;
+	self_test_pixel(&test, &key, "SV_Coverage greater or equal", HLSL_PIXEL_COVERAGE_TARGET);
+	key.alpha_test_function = D3DCMP_LESS;
+	key.alpha_test_samples = 8;
+	self_test_pixel(&test, &key, "SV_Coverage less", HLSL_PIXEL_COVERAGE_TARGET);
+	key.alpha_test_function = D3DCMP_NOTEQUAL;
+	self_test_pixel(&test, &key, "multisampled not equal", HLSL_PIXEL_TARGET);
+	/* the lit pair, with one light and with two: the pixel shaders, then the
+	vertex shaders from the program below */
+	self_test_key(&key, self_test_modes(1, 1, 1, 1), 1, 1, 1, 1);
+	key.per_pixel_lighting = 1;
+	self_test_pixel(&test, &key, "a pixel shader lit by one light", HLSL_PIXEL_TARGET);
+	key.per_pixel_lighting = 2;
+	self_test_pixel(&test, &key, "a pixel shader lit by two", HLSL_PIXEL_TARGET);
+	/* every mask bit of a vertex shader: all packed; all integers with three
+	components; a mixture; none (immediate mode) */
+	count = self_test_program(program);
+	self_test_vertex(&test, &program[0][0], count, 0xffff, 0, 0, NULL, "a vertex shader of packed inputs");
+	self_test_vertex(&test, &program[0][0], count, 0, 0xffff, 0xffff, NULL,
+		"a vertex shader of integer inputs of three components");
+	self_test_vertex(&test, &program[0][0], count, 0x00ff, 0xff00, 0xf0f0, NULL, "a vertex shader of mixed inputs");
+	self_test_vertex(&test, &program[0][0], count, 0, 0, 0, NULL, "an immediate vertex shader");
+	memset(&lighting, 0, sizeof(lighting));
+	lighting.lights = 1;
+	lighting.normal_instruction = 17;
+	lighting.normal_register = 2;
+	self_test_vertex(&test, &program[0][0], count, 0, 0, 0, &lighting, "a vertex shader lit by one light");
+	lighting.lights = 2;
+	lighting.position_instruction = 18;
+	lighting.position_register = 4;
+	self_test_vertex(&test, &program[0][0], count, 0, 0, 0, &lighting, "a vertex shader lit by two");
+	if (test.failed)
+	{
+		snprintf(line, line_size, "d3d11: shader self-test: FAILED (%d of %d synthetic shaders: %s)", test.failed,
+			test.count, test.failures);
+	}
+	else
+	{
+		snprintf(line, line_size, "d3d11: shader self-test: ok (%d synthetic shaders compile: fog in each mode, "
+			"colour sign, alpha kill on every stage, every texture mode and sampler type, the point threshold, the "
+			"combiners' mappings, every alpha test, the lit pair with one and two lights, every vertex mask bit and "
+			"operation, SV_Coverage at ps_4_1)", test.count);
+	}
+}
+
 /* prepare_draw's guards (d3d8_gl.c): a draw with no program, no vertex
 shader or no instructions is skipped, as is one debug.gpu_skip_vertex_shaders
 names; and here, a draw with no rings to copy its data into. The rest of
-prepare_draw (the key, the program, the state) is phases 4 and 5's. */
+prepare_draw (the program, the state) is phase 5's; the key and the vertex
+shader's variant are draw_note's. */
 static BOOL draw_ready(void)
 {
 	struct vertex_shader_object *program = current_program();
@@ -2078,6 +2888,7 @@ void WINAPI D3DDevice_DrawVertices(D3DPRIMITIVETYPE primitive_type, UINT start_v
 {
 	if (!vertex_count || !draw_ready())
 		return;
+	draw_note(FALSE);
 	stream_data(start_vertex, vertex_count);
 	if (primitive_type == D3DPT_QUADLIST)
 	{
@@ -2102,6 +2913,7 @@ void WINAPI D3DDevice_DrawIndexedVertices(D3DPRIMITIVETYPE primitive_type, UINT 
 
 	if (!vertex_count || !index_data || !draw_ready())
 		return;
+	draw_note(FALSE);
 	/* quads are drawn as triangles, from indices made for the draw */
 	mirrored = primitive_type != D3DPT_QUADLIST &&
 		mirror_range((unsigned long)index_data, vertex_count * sizeof(WORD), &index_segment, &index_offset, &generation);
@@ -2161,6 +2973,7 @@ void WINAPI D3DDevice_End(void)
 	device.immediate_active = FALSE;
 	if (!count || !draw_ready())
 		return;
+	draw_note(TRUE);
 	/* (the vertices streamed; every attribute four floats, one after
 	another: the immediate vertex array, layout_attribute, vertex_array_get,
 	and the ring bound at the offset this returns, state_vertex_buffer, are
@@ -2449,7 +3262,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		them, and its skipped draws over the 60 frames; the targets alive; the
 		KB mirrored and streamed a frame, as d3d8_gl.c's line has them, the KB
 		written into segments a frame, the segments alive and the rings'
-		discards since the last line; the presents and resizes since the last
+		discards since the last line; the pixel shader keys and vertex shader
+		variants met since the start; the presents and resizes since the last
 		line; the stub calls since the start, which phase 6 brings to 0; the
 		layer's messages since the last line, when debug.d3d11_debug asks for
 		the layer) */
@@ -2460,7 +3274,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			snprintf(layer, sizeof(layer), "; %lu debug layer messages", stats.debug_messages);
 		platform_log("frame %lu: Direct3D 11 clears only; %lu draws, %lu immediate dropped; skipped in 60 frames: %lu no "
 			"program, %lu no buffer; %lu clears (%lu by clear calls, %lu drawn), %lu target changes, %lu targets; %lu KB "
-			"mirrored, %lu KB streamed, %lu KB uploaded to %lu segments, %lu ring discards; %lu presented, %lu not; "
+			"mirrored, %lu KB streamed, %lu KB uploaded to %lu segments, %lu ring discards; %lu pixel keys, %lu vertex "
+			"variants met; %lu presented, %lu not; "
 			"%lu swap chain resizes; %lu GL stub calls%s",
 			device.frame, stats.draws / stats.presents, stats.immediate_draws / stats.presents,
 			stats.skipped_no_program, stats.skipped_no_buffer,
@@ -2468,13 +3283,15 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			stats.target_changes / stats.presents, (unsigned long)d3d11_backend_targets_alive(),
 			stats.mirrored_bytes / stats.presents / 1024, stats.streamed_bytes / stats.presents / 1024,
 			stats.uploaded_bytes / stats.presents / 1024, (unsigned long)d3d11_backend_segments_alive(),
-			(unsigned long)(discards - device.discards_before), stats.presented,
+			(unsigned long)(discards - device.discards_before), shaders_met.pixel_keys, shaders_met.vertex_variants,
+			stats.presented,
 			stats.not_presented, (unsigned long)(resizes - device.resizes_before),
 			gl_stubs_calls() - device.gl_stub_calls_before, layer);
 		device.resizes_before = resizes;
 		device.discards_before = discards;
 		memset(&stats, 0, sizeof(stats));
 	}
+	dump_say();
 	platform_pump_events();
 
 	pthread_mutex_lock(&vertical_blank_lock);
