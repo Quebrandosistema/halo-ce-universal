@@ -62,8 +62,8 @@ is the same game with a renderer that uses Direct3D 11 instead of OpenGL. The
 renderer is in development: refer to [D3D11.md](D3D11.md). At this time the
 window shows only the clears of the game: the plain colours that the game
 fills its screen with before it draws. The renderer copies the vertices and
-the indices of each draw of the game into Direct3D buffers, but it does not
-draw them yet. The menus, the game, the sound and the input operate, but the
+the indices of each draw of the game into Direct3D buffers, and makes the
+shader key of each draw, but it does not draw them yet. The menus, the game, the sound and the input operate, but the
 executable draws nothing else. To play, use `halo.exe`.
 
 The two executables use the same `config.toml`, the same game data and the
@@ -74,7 +74,7 @@ same saved games. These settings apply only to `halo_d3d11.exe`:
 | `display.d3d11_adapter` | `""` | `HALO_D3D11_ADAPTER` | The graphics adapter. Empty for the fastest GPU, `"warp"` for the software renderer of Microsoft, or a part of the name of an adapter. If no adapter has that name, the executable uses the fastest GPU. |
 | `debug.d3d11_debug` | `false` | `HALO_D3D11_DEBUG` | Writes the messages of the Direct3D debug layer to the log. The debug layer is in the Graphics Tools feature of Windows (Settings, Optional features). |
 | `debug.d3d11_present_marker` | `false` | `HALO_D3D11_PRESENT_MARKER` | Draws a red square at the top left and a green square at the top right of the picture. Thus a screenshot of the window shows the orientation and the edges of the picture. |
-| `debug.d3d11_self_test` | `false` | `HALO_D3D11_SELF_TEST` | At start, the renderer tests its clears on small targets of its own, then the copies of the game's memory into its buffers. It writes the two results to the log (`d3d11: clears self-test: ok` and `d3d11: memory self-test: ok`, or `FAILED` and the first difference). |
+| `debug.d3d11_self_test` | `false` | `HALO_D3D11_SELF_TEST` | At start, the renderer tests its clears on small targets of its own, then the copies of the game's memory into its buffers, then its HLSL generators: it compiles synthetic shaders for the cases that the game seldom uses. It writes the three results to the log (`d3d11: clears self-test: ok`, `d3d11: memory self-test: ok` and `d3d11: shader self-test: ok`, or `FAILED` and the first difference or the shaders that did not compile). |
 
 The log of the port has a `renderer:` line. This line gives the
 adapter, the feature level, the version of the driver and the state of the
@@ -84,6 +84,21 @@ it (`d3d11: buffers: ...`) gives the buffers for the game's memory and the
 free address space of the process. The
 `debug.screenshot_every` and `debug.screenshot_directory` settings operate
 as in `halo.exe`.
+
+`debug.gpu_dump_shaders` (`HALO_GPU_DUMP_SHADERS`) names a folder. In
+`halo.exe`, the renderer writes the GLSL of each shader that it compiles to
+that folder. In `halo_d3d11.exe`, the renderer writes the first time that a
+draw uses each shader: its HLSL (`vs<hash>.hlsl`, `ps<hash>.hlsl`), the GLSL
+that `halo.exe` makes for the same shader (`.glsl`), the key of each pixel
+shader (`.key`) and a line for each file in `manifest.txt`. The runs add to
+the files in the folder. To check the folder, enter
+`python tools/d3d11_shader_check.py <folder> [<folder of halo.exe>]`. The
+script compiles each shader with `d3dcompiler_47.dll` and makes sure that
+each HLSL text is its GLSL text with only the changes of the dialect. It
+gives the statistics of the keys and, with the folder of `halo.exe`, the
+shaders that the two folders have in common. The statistics line
+(`debug.gpu_stats`) gives the number of pixel shader keys and vertex shader
+variants that the draws used since the start.
 
 ## How the port operates
 
@@ -134,6 +149,10 @@ libraries of the link.
 - `d3d11/d3d8_d3d11.c` is the Direct3D 8 device of the game. It is a copy
   of `port/linux/src/d3d8_gl.c` without OpenGL, and uses the Xbox SDK
   declarations.
+- `d3d11/nv2a_vsh_hlsl.c` and `d3d11/nv2a_psh_hlsl.c` are copies of the
+  shader generators `port/linux/src/nv2a_vsh.c` and `nv2a_psh.c` that write
+  HLSL instead of GLSL. `d3d11/hlsl_shaders.h` gives the constant buffers,
+  the interface between the two stages and the version of the generators.
 - `d3d11/win32_d3d11.c`, `d3d11/win32_d3d11_present.c` and
   `d3d11/win32_d3d11_memory.c` use only the Windows SDK.
   `d3d11/win32_d3d11.h` is shared by these three files.
