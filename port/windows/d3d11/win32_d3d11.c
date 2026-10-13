@@ -751,15 +751,20 @@ uint32_t d3d11_backend_target_create(uint32_t pixel_width, uint32_t pixel_height
 	if (target_count == target_capacity)
 	{
 		uint32_t capacity = target_capacity ? target_capacity * 2 : 64;
+		/* (the bound pointers follow the table: their places in it, taken
+		before realloc frees the old one; -1 for none, or one not in it) */
+		ptrdiff_t color_at = bound_color && bound_color >= targets && bound_color < targets + target_count ?
+			bound_color - targets : -1;
+		ptrdiff_t depth_at = bound_depth && bound_depth >= targets && bound_depth < targets + target_count ?
+			bound_depth - targets : -1;
 		struct target *grown = realloc(targets, capacity * sizeof(*targets));
 
 		if (!grown)
 			return 0;
-		/* (the bound pointers follow the table) */
-		if (bound_color && bound_color >= targets && bound_color < targets + target_count)
-			bound_color = grown + (bound_color - targets);
-		if (bound_depth && bound_depth >= targets && bound_depth < targets + target_count)
-			bound_depth = grown + (bound_depth - targets);
+		if (color_at >= 0)
+			bound_color = grown + color_at;
+		if (depth_at >= 0)
+			bound_depth = grown + depth_at;
 		targets = grown;
 		target_capacity = capacity;
 	}

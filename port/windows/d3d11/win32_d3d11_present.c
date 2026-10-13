@@ -229,8 +229,11 @@ int d3d11_backend_present(uint32_t back_buffer, uint32_t window_width, uint32_t 
 	}
 	if (B.lost)
 		return -1;
+	/* (no view: a ResizeBuffers that failed, which is not asked for again
+	until the window's size changes; the frame rests as a minimised one does,
+	so that a game with no frame limit does not spin until then) */
 	if (!P.view)
-		return 0;
+		return nothing_shown();
 
 	/* 2. the letterbox, as d3d8_gl.c's Present works it out: the largest
 	rectangle of the back buffer's shape that fits, centred */
