@@ -2,9 +2,11 @@
 WIN32_D3D11.H
 
 What the Direct3D 11 backend's own units share (port/windows/D3D11.md):
-win32_d3d11.c (the device, the targets, the clears, the built-in shaders and
-the compiler), win32_d3d11_present.c (the swap chain and the present) and
-win32_d3d11_memory.c (the rings, the segments, the upload ring). Windows SDK's types:
+win32_d3d11.c (the device, the targets, the clears, the built-in shaders),
+win32_d3d11_present.c (the swap chain and the present), win32_d3d11_memory.c
+(the rings, the segments, the upload ring) and win32_d3d11_shaders.c (the
+compiler, the shader service and its cache, the layouts, the state objects).
+Windows SDK's types:
 only the Windows-facing units include it; the device (d3d8_d3d11.c) sees
 d3d11_backend.h alone.
 */
@@ -100,7 +102,9 @@ ID3D11ShaderResourceView *d3d11_backend_target_view(uint32_t handle, uint32_t *w
 /* HLSL compiled through d3dcompiler_47.dll (loaded at the first call) at
 D3DCOMPILE_OPTIMIZATION_LEVEL3; name is the source's in messages. 1 with the
 bytecode in code; 0 if the compiler is missing or the source did not compile
-(logged with the compiler's messages). */
+(logged with the compiler's messages). The shader service's unit's
+(win32_d3d11_shaders.c); the built-in shaders compile through it, outside the
+service's cache. */
 int d3d11_backend_compile(const char *source, size_t size, const char *name, const char *entry, const char *target,
 	ID3DBlob **code);
 
@@ -131,5 +135,9 @@ int d3d11_backend_read_target(struct target *target, void *pixels, size_t size);
 /* the memory unit's objects released (d3d11_backend_destroy, after the
 present's and before the targets') */
 void d3d11_backend_memory_release(void);
+
+/* the shader service's shaders, layouts and state objects released
+(d3d11_backend_destroy, after the memory unit's) */
+void d3d11_backend_shaders_release(void);
 
 #endif

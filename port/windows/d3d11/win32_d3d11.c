@@ -25,12 +25,18 @@ released by destroy.
 Phase 4: d3d11_backend_shader_compiles, the compile the HLSL generators'
 self-test asks for (d3d8_d3d11.c).
 
+Phase 5: the compiler's loading, d3d11_backend_compile and
+d3d11_backend_shader_compiles moved to the shader
+service's unit (win32_d3d11_shaders.c), which the built-in shaders compile
+through, outside its cache; destroy releases the service's objects after the
+memory unit's.
+
 hr_text, drain_debug (as backend_drain_debug), choose_adapter and
 create_device are copied from phase 0's probe (win32_d3d11_probe.c), where they
 were tried on this machine's Adreno and on WARP, and changed only for what the
 backend keeps and reports: a name that matches no adapter takes the first
 hardware adapter (the game has a window to keep), and below feature level 11_0
-there is no device. load_compiler is the probe's as well, without its report.
+there is no device.
 */
 
 #include <ctype.h>
@@ -419,11 +425,13 @@ void d3d11_backend_destroy(void)
 		return;
 	backend_drain_debug();
 	ID3D11DeviceContext_ClearState(B.context);
-	/* the present's objects, the memory unit's, then the targets and the
-	clears'; the flush after them lets the context destroy what it still held
-	of them (the live-object report counts an object until then) */
+	/* the present's objects, the memory unit's, the shader service's, then
+	the targets and the clears'; the flush after them lets the context destroy
+	what it still held of them (the live-object report counts an object until
+	then) */
 	d3d11_backend_present_release();
 	d3d11_backend_memory_release();
+	d3d11_backend_shaders_release();
 	resources_release();
 	ID3D11DeviceContext_Flush(B.context);
 	release(&B.context);
@@ -507,8 +515,6 @@ ID3D11RasterizerState *d3d11_backend_scissored;
 
 static struct
 {
-	HMODULE library;
-	pD3DCompile compile;
 	/* 1 made, -1 failed (logged once), 0 not tried */
 	int state;
 	ID3D11PixelShader *clear_ps;
@@ -519,52 +525,6 @@ static struct
 	/* by (depth asked, 1) | (stencil asked, 2) */
 	ID3D11DepthStencilState *depth_stencil[4];
 } S;
-
-/* d3dcompiler_47.dll, as the probe loads it (win32_d3d11_probe.c, load_compiler) */
-static int load_compiler(void)
-{
-	if (S.compile)
-		return 1;
-	S.library = LoadLibraryA("d3dcompiler_47.dll");
-	if (S.library)
-		S.compile = (pD3DCompile)(void *)GetProcAddress(S.library, "D3DCompile");
-	if (!S.compile)
-	{
-		platform_log("d3d11: the shader compiler is not available (d3dcompiler_47.dll: %s, error %lu): the "
-			"clears that are drawn are skipped and the window stays black", S.library ? "no D3DCompile" : "not loaded",
-			GetLastError());
-		return 0;
-	}
-	return 1;
-}
-
-int d3d11_backend_compile(const char *source, size_t size, const char *name, const char *entry, const char *target,
-	ID3DBlob **code)
-{
-	ID3DBlob *messages = NULL;
-	HRESULT result;
-
-	if (!load_compiler())
-		return 0;
-	result = S.compile(source, size, name, NULL, NULL, entry, target, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, code,
-		&messages);
-	if (FAILED(result))
-		platform_log("d3d11: the %s shader %s (%s) did not compile (%s): %.*s", name, entry, target, hr_text(result),
-			messages ? (int)ID3D10Blob_GetBufferSize(messages) : 0,
-			messages ? (const char *)ID3D10Blob_GetBufferPointer(messages) : "");
-	release(&messages);
-	return SUCCEEDED(result);
-}
-
-int d3d11_backend_shader_compiles(const char *source, size_t size, const char *name, const char *entry,
-	const char *target)
-{
-	ID3DBlob *code = NULL;
-	int compiled = d3d11_backend_compile(source, size, name, entry, target, &code);
-
-	release(&code);
-	return compiled;
-}
 
 static int compile(const char *entry, const char *target, ID3DBlob **code)
 {
@@ -582,7 +542,7 @@ static int make_shaders(void)
 	HRESULT result = S_OK;
 	int index;
 
-	if (!load_compiler() || !compile("triangle_vs", "vs_4_0", &vs) || !compile("clear_ps", "ps_4_0", &clear) ||
+	if (!compile("triangle_vs", "vs_4_0", &vs) || !compile("clear_ps", "ps_4_0", &clear) ||
 		!compile("present_ps", "ps_4_0", &present))
 	{
 		release(&vs);

@@ -52,8 +52,19 @@ guards (draw_note), kept in tables as fragment_shader_get's, and each first
 met dumped with debug.gpu_dump_shaders: its HLSL from the generators' copies
 (nv2a_vsh_hlsl.c, nv2a_psh_hlsl.c), its GLSL twin from the originals, the
 key's bytes and a manifest, for tools/d3d11_shader_check.py; and the
-generators' self-test (debug.d3d11_self_test's third line). Nothing is
-compiled at the draw yet (phase 5).
+generators' self-test (debug.d3d11_self_test's third line).
+
+Phase 5: at every draw draw_note also asks the backend's shader service
+(win32_d3d11_shaders.c) for the two shaders' handles, compiling a shader the
+first time it is met and not in the cache on the disk, as d3d8_gl.c compiles
+its GLSL at the draw (a lit pair that fails sets lighting_failed as
+prepare_draw does; a shader that fails skips its draws); for the input layout
+from the declaration's elements (attribute_format's table as DXGI formats);
+and for the blend, depth-stencil and rasterizer states and each sampled
+stage's sampler, translated from the Xbox's enumerants as apply_raster_state
+and configure_sampler read them. The handles are kept in device.draw for phase
+6 to bind; nothing is bound or drawn yet. debug.d3d11_self_test's fourth line
+is the service's.
 */
 
 #include "xgpu.h"
@@ -68,6 +79,7 @@ compiled at the draw yet (phase 5).
 /* the GL calls counted by the stubs since the start (build/windows/gl_stubs.c) */
 unsigned long gl_stubs_calls(void);
 
+#include <float.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -320,6 +332,19 @@ struct vertex_element
 
 struct vertex_variant;
 
+/* the input layouts a declaration's draws met (draw_layout), the last few:
+by the vertex shader variant and the streams with data, as d3d8_gl.c's
+vertex_array and vertex_array_streams */
+#define DECLARATION_LAYOUTS 4
+
+struct declaration_layout
+{
+	const struct vertex_variant *variant;
+	unsigned long streams;
+	/* the backend's layout, 0 if it could not be made */
+	uint32_t handle;
+};
+
 struct vertex_shader_object
 {
 	unsigned long signature;
@@ -348,6 +373,9 @@ struct vertex_shader_object
 	/* a shader lit for each pixel failed to compile or link: lit as the
 	vertex shader lights it from then on */
 	BOOL lighting_failed;
+	/* as a declaration: its draws' layouts (draw_layout) */
+	struct declaration_layout layouts[DECLARATION_LAYOUTS];
+	unsigned long layout_count;
 };
 
 /* ---------- the device */
@@ -426,6 +454,18 @@ struct d3d11_device
 	last said */
 	uint32_t resizes_before;
 	uint32_t discards_before;
+	/* what the draw noted last would bind (draw_note), the backend's handles:
+	its shaders, its input layout, its state objects and a sampler for each
+	stage with a texture (0 for one without); phase 6 binds them */
+	struct
+	{
+		uint32_t vertex_shader, pixel_shader, layout;
+		uint32_t blend, depth_stencil, rasterizer;
+		uint32_t samplers[D3DTSS_MAXSTAGES];
+	} draw;
+	/* the shader service's statistics after the self-tests
+	(backend_initialize): the statistics line gives the game's, since */
+	uint32_t shader_statistics_before[D3D11_BACKEND_STATISTICS];
 };
 
 static struct d3d11_device device;
@@ -809,6 +849,7 @@ static BOOL bind_targets(BOOL *has_depth)
 /* ---------- device creation */
 
 static void shader_self_test(char *line, size_t line_size);
+static void shader_service_self_test(char *line, size_t line_size);
 
 /* what gl_initialize does that is not OpenGL, with the Direct3D 11 device in
 its place (port/windows/d3d11/win32_d3d11.c): the backend's one line goes to
@@ -840,9 +881,14 @@ static void backend_initialize(void)
 			sizeof(line)) != 0;
 		platform_log("%s", line);
 	}
+	/* the shader cache on the disk, unless a debug.gpu_debug_* setting
+	changes the generators' text (nv2a_psh_hlsl.c reads them as it writes) */
+	if (device.backend_ready)
+		d3d11_backend_shader_cache_enable(!*config_string("debug.gpu_debug_expression") &&
+			!config_boolean("debug.gpu_debug_texture0") && !config_boolean("debug.gpu_debug_flat"));
 	/* debug.d3d11_self_test: the clears tried on the backend's own targets,
 	then the memory paths on its rings and a segment of its own, then the
-	HLSL generators on synthetic shaders */
+	HLSL generators on synthetic shaders, then the shader service */
 	if (device.backend_ready && config_boolean("debug.d3d11_self_test"))
 	{
 		d3d11_backend_self_test(line, sizeof(line));
@@ -851,6 +897,14 @@ static void backend_initialize(void)
 		platform_log("%s", line);
 		shader_self_test(line, sizeof(line));
 		platform_log("%s", line);
+		shader_service_self_test(line, sizeof(line));
+		platform_log("%s", line);
+	}
+	/* (what the self-tests made is not the game's: the statistics count from
+	here) */
+	if (device.backend_ready)
+	{
+		d3d11_backend_shaders_statistics(device.shader_statistics_before);
 	}
 	/* the rings start full, so that the first write to each orphans it (a
 	DISCARD map): the self-test's writes went to offsets the device does not
@@ -1507,6 +1561,23 @@ static unsigned long vertex_type_bytes(unsigned long type)
 	}
 }
 
+/* the vertex shader's masks an element sets (its identity: hlsl_shaders.h):
+packed (D3DVSDT_NORMPACKED3), integer (D3DVSDT_SHORT1 to 4), three components
+(D3DVSDT_SHORT3, NORMSHORT3, PBYTE3) */
+static void element_masks(const struct vertex_element *element, unsigned long *packed_mask, unsigned long *integer_mask,
+	unsigned long *three_component_mask)
+{
+	if (element->type == D3DVSDT_NORMPACKED3)
+		*packed_mask |= 1UL << element->reg;
+	if (element->type == D3DVSDT_SHORT1 || element->type == D3DVSDT_SHORT2 || element->type == D3DVSDT_SHORT3 ||
+		element->type == D3DVSDT_SHORT4)
+	{
+		*integer_mask |= 1UL << element->reg;
+	}
+	if (element->type == D3DVSDT_SHORT3 || element->type == D3DVSDT_NORMSHORT3 || element->type == D3DVSDT_PBYTE3)
+		*three_component_mask |= 1UL << element->reg;
+}
+
 static void parse_declaration(struct vertex_shader_object *object, const DWORD *declaration)
 {
 	unsigned long stream = 0;
@@ -1540,18 +1611,7 @@ static void parse_declaration(struct vertex_shader_object *object, const DWORD *
 				element->bytes = (unsigned char)vertex_type_bytes(element->type);
 				element->offset = (unsigned short)offsets[stream];
 				offsets[stream] += element->bytes;
-				if (element->type == D3DVSDT_NORMPACKED3)
-					object->packed_mask |= 1UL << element->reg;
-				if (element->type == D3DVSDT_SHORT1 || element->type == D3DVSDT_SHORT2 ||
-					element->type == D3DVSDT_SHORT3 || element->type == D3DVSDT_SHORT4)
-				{
-					object->integer_mask |= 1UL << element->reg;
-				}
-				if (element->type == D3DVSDT_SHORT3 || element->type == D3DVSDT_NORMSHORT3 ||
-					element->type == D3DVSDT_PBYTE3)
-				{
-					object->three_component_mask |= 1UL << element->reg;
-				}
+				element_masks(element, &object->packed_mask, &object->integer_mask, &object->three_component_mask);
 			}
 			break;
 		case D3DVSD_TOKEN_CONSTMEM:
@@ -2140,6 +2200,14 @@ static struct render_target_entry *render_target_find(unsigned long data)
 	return best;
 }
 
+/* what bind_textures hands configure_sampler for a stage (d3d8_gl.c): whether
+the stage has a texture, and so a sampler; whether the texture has mip levels;
+whether it is a high-res HUD texture */
+struct stage_sampling
+{
+	BOOL sampled, mipmapped, hires;
+};
+
 /* bind_textures' decisions for the key, without GL (d3d8_gl.c): a stage with
 no texture, or in modes 0, 0x04, 0x05, has no sampler, and in mode 0x11 a 2D
 one; a render target the stage samples is 2D; otherwise the texture's own
@@ -2147,8 +2215,12 @@ type, a cube map's a cube and a volume's 3D. Stage 0's coverage_alpha and
 point_threshold are its high-res HUD texture's (hud_hires.h), found as the
 texture cache finds it when it uploads the bitmap (xbox_textures.c), without
 the decode: the bitmap's address, sizes and first level's bytes, not
-palettized, not a cube map or a volume. */
-static void key_textures(struct nv2a_pixel_shader_key *key)
+palettized, not a cube map or a volume. Each stage's sampling as
+configure_sampler is given it: a render target's levels only where
+bind_textures composites its mip chain (mip_composite_get), a bitmap's from
+its description, and high-res where the HUD has a texture for it (on any
+stage, as xbox_textures.c finds it). */
+static void key_textures(struct nv2a_pixel_shader_key *key, struct stage_sampling sampling[D3DTSS_MAXSTAGES])
 {
 	int stage;
 
@@ -2157,28 +2229,40 @@ static void key_textures(struct nv2a_pixel_shader_key *key)
 		D3DBaseTexture *texture = device.textures[stage];
 		unsigned long mode = stage_texture_mode(stage);
 		struct xgpu_texture_description description;
+		struct render_target_entry *target;
 
+		memset(&sampling[stage], 0, sizeof(sampling[stage]));
 		if (!texture || !texture->Data || mode == 0 || mode == 0x04 || mode == 0x05 || mode == 0x11)
 		{
 			key->sampler_type[stage] = mode == 0x11 ? _xgpu_sampler_2d : _xgpu_sampler_none;
 			continue;
 		}
+		sampling[stage].sampled = TRUE;
 		/* (a render target: its description's high-res flags are clear) */
-		if (render_target_find(texture->Data))
+		target = render_target_find(texture->Data);
+		if (target)
 		{
+			xgpu_texture_describe(texture->Format, texture->Size, &description);
+			sampling[stage].mipmapped = !description.linear && !description.cube_map && description.levels > 1 &&
+				target->target.width == description.width && target->target.height == description.height;
 			key->sampler_type[stage] = _xgpu_sampler_2d;
 			continue;
 		}
 		xgpu_texture_describe(texture->Format, texture->Size, &description);
-		if (stage == 0 && ((texture->Format & D3DFORMAT_FORMAT_MASK) >> D3DFORMAT_FORMAT_SHIFT) != 0x0b &&
+		sampling[stage].mipmapped = description.levels > 1;
+		if (((texture->Format & D3DFORMAT_FORMAT_MASK) >> D3DFORMAT_FORMAT_SHIFT) != 0x0b &&
 			!description.cube_map && description.depth == 1)
 		{
 			long override = hud_hires_override_find((unsigned long)PLATFORM_PHYSICAL_TO_VIRTUAL(texture->Data),
 				description.width, description.height, description.levels > 1 ?
 				xgpu_texture_level_offset(&description, 1) : xgpu_texture_face_size(&description));
 
-			key->coverage_alpha = override >= 0 && hud_hires_override_coverage(override);
-			key->point_threshold = override >= 0 && hud_hires_override_point_threshold(override);
+			sampling[stage].hires = override >= 0;
+			if (stage == 0)
+			{
+				key->coverage_alpha = override >= 0 && hud_hires_override_coverage(override);
+				key->point_threshold = override >= 0 && hud_hires_override_point_threshold(override);
+			}
 		}
 		key->sampler_type[stage] = description.cube_map ? _xgpu_sampler_cube :
 			description.depth > 1 ? _xgpu_sampler_3d : _xgpu_sampler_2d;
@@ -2187,8 +2271,8 @@ static void key_textures(struct nv2a_pixel_shader_key *key)
 
 /* prepare_draw's key (d3d8_gl.c), without GL: alpha_test_samples stays 0
 (the target's samples are phase 6's) and count_samples 0 (the visibility
-tests are occlusion queries, phase 6) */
-static void pixel_key_make(struct nv2a_pixel_shader_key *key)
+tests are occlusion queries, phase 6); and each stage's sampling */
+static void pixel_key_make(struct nv2a_pixel_shader_key *key, struct stage_sampling sampling[D3DTSS_MAXSTAGES])
 {
 	int stage;
 
@@ -2200,7 +2284,7 @@ static void pixel_key_make(struct nv2a_pixel_shader_key *key)
 	key->combiner_state[D3DRS_PSFINALCOMBINERCONSTANT0] = 0;
 	key->combiner_state[D3DRS_PSFINALCOMBINERCONSTANT1] = 0;
 	key->texture_modes = D3D__RenderState[D3DRS_PSTEXTUREMODES];
-	key_textures(key);
+	key_textures(key, sampling);
 	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
 	{
 		key->alpha_kill[stage] = D3D__TextureState[stage][D3DTSS_ALPHAKILL] == D3DTALPHAKILL_ENABLE;
@@ -2216,8 +2300,8 @@ static void pixel_key_make(struct nv2a_pixel_shader_key *key)
 	key->fog_table_mode = (unsigned char)D3D__RenderState[D3DRS_FOGTABLEMODE];
 }
 
-/* a pixel shader the draws met, by its key (d3d8_gl.c's fragment_entry);
-phase 5 gives it its handle */
+/* a pixel shader the draws met, by its key (d3d8_gl.c's fragment_entry),
+with the backend's handle once asked for (pixel_shader_handle) */
 struct pixel_entry
 {
 	struct pixel_entry *next;
@@ -2225,11 +2309,14 @@ struct pixel_entry
 	struct nv2a_pixel_shader_key key;
 	uint64_t identity;
 	uint32_t handle;
+	/* its compile failed: its draws are skipped for the run */
+	BOOL failed;
 };
 
 /* a vertex shader variant the draws met: the program's words, the
 declaration's three masks (0 for immediate mode) and lit (vertex_shader_get's
-choice, d3d8_gl.c), phase 5 its handle */
+choice, d3d8_gl.c), with the backend's handle once asked for
+(vertex_shader_handle) */
 struct vertex_variant
 {
 	struct vertex_variant *next;
@@ -2238,6 +2325,11 @@ struct vertex_variant
 	uint32_t packed_mask, integer_mask, three_component_mask;
 	BOOL lit;
 	uint32_t handle;
+	/* its compile failed: its draws are skipped for the run */
+	BOOL failed;
+	/* immediate mode's layout over it (draw_layout), once asked for */
+	uint32_t immediate_layout;
+	BOOL immediate_layout_made;
 };
 
 #define PIXEL_BUCKETS 1024
@@ -2255,6 +2347,15 @@ static struct
 	unsigned long vertex_dumped_said, pixel_dumped_said;
 	FILE *manifest;
 	BOOL manifest_failed;
+	/* the draws skipped for a shader that failed and for a layout that
+	could not be made, since the start */
+	unsigned long skipped_no_shader, skipped_no_layout;
+	/* the layouts the draws made (the backend's handles above layouts_seen
+	are new), counted by the Xbox vertex type of their elements, and the
+	count when the log last said */
+	uint32_t layouts_seen;
+	unsigned long layouts_made, layouts_said;
+	unsigned long layout_types[256];
 } shaders_met;
 
 /* a pixel shader's identity: the generator's version and the key's bytes */
@@ -2506,21 +2607,691 @@ static struct vertex_variant *vertex_variant_get(struct vertex_shader_object *pr
 	return variant;
 }
 
+/* ---------- the shaders' handles (phase 5)
+
+Each entry asks the backend's shader service for its handle the first time a
+draw needs it (d3d11_backend_shader_find: made this run, or from the cache's
+file), and on a miss generates its HLSL (nv2a_vsh_hlsl.c, nv2a_psh_hlsl.c)
+and has it compiled now (d3d11_backend_shader_make), as d3d8_gl.c compiles
+its GLSL at the draw. A shader that fails stays failed for the run. */
+
+static uint32_t vertex_shader_handle(struct vertex_variant *variant)
+{
+	const struct vertex_shader_object *program;
+	char *text;
+
+	if (!variant)
+		return 0;
+	if (variant->handle || variant->failed)
+		return variant->handle;
+	variant->handle = d3d11_backend_shader_find(D3D11_BACKEND_STAGE_VERTEX, variant->identity);
+	if (!variant->handle)
+	{
+		program = variant->program;
+		text = nv2a_hlsl_vertex_shader((const uint32_t *)program->instructions, (uint32_t)program->instruction_count,
+			variant->packed_mask, variant->integer_mask, variant->three_component_mask,
+			variant->lit ? &program->lighting : NULL);
+		if (text)
+			variant->handle = d3d11_backend_shader_make(D3D11_BACKEND_STAGE_VERTEX, variant->identity, text,
+				strlen(text), HLSL_ENTRY, HLSL_VERTEX_TARGET);
+		free(text);
+		backend_lost_check();
+	}
+	variant->failed = !variant->handle;
+	return variant->handle;
+}
+
+static uint32_t pixel_shader_handle(struct pixel_entry *entry)
+{
+	char target[8];
+	char *text;
+
+	if (!entry)
+		return 0;
+	if (entry->handle || entry->failed)
+		return entry->handle;
+	entry->handle = d3d11_backend_shader_find(D3D11_BACKEND_STAGE_PIXEL, entry->identity);
+	if (!entry->handle)
+	{
+		text = nv2a_hlsl_pixel_shader(&entry->key, target);
+		if (text)
+			entry->handle = d3d11_backend_shader_make(D3D11_BACKEND_STAGE_PIXEL, entry->identity, text, strlen(text),
+				HLSL_ENTRY, target);
+		free(text);
+		backend_lost_check();
+	}
+	entry->failed = !entry->handle;
+	return entry->handle;
+}
+
+/* ---------- input layouts (phase 5)
+
+A layout from the declaration's elements (d3d8_gl.c's setup_streams and
+layout_attribute): one element an input register, the last that names it,
+the streams with data only; the format from the Xbox type as attribute_format
+reads it (below). Kept on the declaration by the vertex shader variant and the
+streams with data (d3d8_gl.c keeps its vertex array so), and by the backend
+by its hash. Immediate mode's: sixteen four-float attributes, one after
+another (End). An input the elements leave out is read from the attribute
+slot (d3d11_backend.h). */
+
+/* attribute_format (d3d8_gl.c) as DXGI formats: GL's three-component 16-bit
+and 8-bit formats read four here (the shader's three_component_mask gives w
+its 1 back), its signed shorts as integers (integer_mask: the shader makes
+them floats), a packed normal one 32-bit integer (packed_mask), D3DCOLOR in
+its byte order (GL_BGRA) */
+static uint32_t attribute_format(unsigned long type)
+{
+	switch (type)
+	{
+	case D3DVSDT_FLOAT1: return D3D11_BACKEND_FORMAT_R32_FLOAT;
+	case D3DVSDT_FLOAT2: return D3D11_BACKEND_FORMAT_R32G32_FLOAT;
+	case D3DVSDT_FLOAT3: case D3DVSDT_FLOAT2H: return D3D11_BACKEND_FORMAT_R32G32B32_FLOAT;
+	case D3DVSDT_FLOAT4: return D3D11_BACKEND_FORMAT_R32G32B32A32_FLOAT;
+	case D3DVSDT_D3DCOLOR: return D3D11_BACKEND_FORMAT_B8G8R8A8_UNORM;
+	case D3DVSDT_SHORT1: return D3D11_BACKEND_FORMAT_R16_SINT;
+	case D3DVSDT_SHORT2: return D3D11_BACKEND_FORMAT_R16G16_SINT;
+	case D3DVSDT_SHORT3: case D3DVSDT_SHORT4: return D3D11_BACKEND_FORMAT_R16G16B16A16_SINT;
+	case D3DVSDT_NORMSHORT1: return D3D11_BACKEND_FORMAT_R16_SNORM;
+	case D3DVSDT_NORMSHORT2: return D3D11_BACKEND_FORMAT_R16G16_SNORM;
+	case D3DVSDT_NORMSHORT3: case D3DVSDT_NORMSHORT4: return D3D11_BACKEND_FORMAT_R16G16B16A16_SNORM;
+	case D3DVSDT_PBYTE1: return D3D11_BACKEND_FORMAT_R8_UNORM;
+	case D3DVSDT_PBYTE2: return D3D11_BACKEND_FORMAT_R8G8_UNORM;
+	case D3DVSDT_PBYTE3: case D3DVSDT_PBYTE4: return D3D11_BACKEND_FORMAT_R8G8B8A8_UNORM;
+	case D3DVSDT_NORMPACKED3: return D3D11_BACKEND_FORMAT_R32_UINT;
+	default: return D3D11_BACKEND_FORMAT_R32G32B32A32_FLOAT;
+	}
+}
+
+static const char *vertex_type_name(unsigned long type)
+{
+	switch (type)
+	{
+	case D3DVSDT_FLOAT1: return "FLOAT1";
+	case D3DVSDT_FLOAT2: return "FLOAT2";
+	case D3DVSDT_FLOAT3: return "FLOAT3";
+	case D3DVSDT_FLOAT4: return "FLOAT4";
+	case D3DVSDT_FLOAT2H: return "FLOAT2H";
+	case D3DVSDT_D3DCOLOR: return "D3DCOLOR";
+	case D3DVSDT_SHORT1: return "SHORT1";
+	case D3DVSDT_SHORT2: return "SHORT2";
+	case D3DVSDT_SHORT3: return "SHORT3";
+	case D3DVSDT_SHORT4: return "SHORT4";
+	case D3DVSDT_NORMSHORT1: return "NORMSHORT1";
+	case D3DVSDT_NORMSHORT2: return "NORMSHORT2";
+	case D3DVSDT_NORMSHORT3: return "NORMSHORT3";
+	case D3DVSDT_NORMSHORT4: return "NORMSHORT4";
+	case D3DVSDT_PBYTE1: return "PBYTE1";
+	case D3DVSDT_PBYTE2: return "PBYTE2";
+	case D3DVSDT_PBYTE3: return "PBYTE3";
+	case D3DVSDT_PBYTE4: return "PBYTE4";
+	case D3DVSDT_NORMPACKED3: return "NORMPACKED3";
+	default: return NULL;
+	}
+}
+
+/* the declaration's elements as the layout's, for the streams with data
+(a mask); their number. The Xbox types each element had, in types. */
+static uint32_t layout_elements(const struct vertex_shader_object *declaration, unsigned long streams,
+	struct d3d11_backend_layout_element elements[XGPU_VERTEX_ATTRIBUTE_COUNT],
+	unsigned char types[XGPU_VERTEX_ATTRIBUTE_COUNT])
+{
+	long by_register[XGPU_VERTEX_ATTRIBUTE_COUNT];
+	unsigned long index;
+	uint32_t count = 0;
+
+	for (index = 0; index < XGPU_VERTEX_ATTRIBUTE_COUNT; index++)
+		by_register[index] = -1;
+	for (index = 0; index < declaration->element_count; index++)
+	{
+		const struct vertex_element *element = &declaration->elements[index];
+
+		if (element->type == D3DVSDT_NONE || element->reg >= XGPU_VERTEX_ATTRIBUTE_COUNT ||
+			!(streams & (1UL << element->stream)))
+		{
+			continue;
+		}
+		by_register[element->reg] = (long)index;
+	}
+	for (index = 0; index < XGPU_VERTEX_ATTRIBUTE_COUNT; index++)
+	{
+		const struct vertex_element *element;
+
+		if (by_register[index] < 0)
+			continue;
+		element = &declaration->elements[by_register[index]];
+		elements[count].semantic_index = (uint32_t)index;
+		elements[count].format = attribute_format(element->type);
+		elements[count].slot = element->stream;
+		elements[count].offset = element->offset;
+		types[count] = element->type;
+		count++;
+	}
+	return count;
+}
+
+/* a layout the backend answered: counted by its elements' types if it is
+new */
+static void layout_count(uint32_t handle, const unsigned char *types, uint32_t count)
+{
+	uint32_t index;
+
+	/* (the self-tests' layouts are not the draws') */
+	if (shaders_met.layouts_seen < device.shader_statistics_before[D3D11_BACKEND_STATISTIC_LAYOUTS])
+		shaders_met.layouts_seen = device.shader_statistics_before[D3D11_BACKEND_STATISTIC_LAYOUTS];
+	if (!handle || handle <= shaders_met.layouts_seen)
+		return;
+	shaders_met.layouts_seen = handle;
+	shaders_met.layouts_made++;
+	for (index = 0; index < count; index++)
+		shaders_met.layout_types[types[index]]++;
+}
+
+/* the streams the declaration reads that have data (stream_data's test) */
+static unsigned long layout_streams(const struct vertex_shader_object *declaration)
+{
+	unsigned long index, streams = 0;
+
+	for (index = 0; index < declaration->element_count; index++)
+	{
+		const struct vertex_element *element = &declaration->elements[index];
+
+		if (element->type != D3DVSDT_NONE && element->stream < 16 && device.streams[element->stream].data)
+			streams |= 1UL << element->stream;
+	}
+	return streams;
+}
+
+/* the draw's layout: immediate mode's over the variant, or the
+declaration's for the variant and the streams with data; 0 if it could not
+be made */
+static uint32_t draw_layout(struct vertex_variant *variant, uint32_t vertex_shader, BOOL immediate)
+{
+	struct vertex_shader_object *declaration = device.vertex_shader;
+	struct d3d11_backend_layout_element elements[XGPU_VERTEX_ATTRIBUTE_COUNT];
+	unsigned char types[XGPU_VERTEX_ATTRIBUTE_COUNT];
+	struct declaration_layout *slot;
+	unsigned long streams, index;
+	uint32_t count;
+
+	if (immediate)
+	{
+		if (!variant->immediate_layout_made)
+		{
+			for (index = 0; index < XGPU_VERTEX_ATTRIBUTE_COUNT; index++)
+			{
+				elements[index].semantic_index = (uint32_t)index;
+				elements[index].format = D3D11_BACKEND_FORMAT_R32G32B32A32_FLOAT;
+				elements[index].slot = 0;
+				elements[index].offset = (uint32_t)(index * 4 * sizeof(float));
+				types[index] = D3DVSDT_FLOAT4;
+			}
+			variant->immediate_layout = d3d11_backend_layout_make(elements, XGPU_VERTEX_ATTRIBUTE_COUNT, vertex_shader);
+			variant->immediate_layout_made = TRUE;
+			layout_count(variant->immediate_layout, types, XGPU_VERTEX_ATTRIBUTE_COUNT);
+			backend_lost_check();
+		}
+		return variant->immediate_layout;
+	}
+	streams = layout_streams(declaration);
+	for (index = 0; index < DECLARATION_LAYOUTS && index < declaration->layout_count; index++)
+	{
+		slot = &declaration->layouts[index];
+		if (slot->variant == variant && slot->streams == streams)
+			return slot->handle;
+	}
+	slot = &declaration->layouts[declaration->layout_count++ % DECLARATION_LAYOUTS];
+	count = layout_elements(declaration, streams, elements, types);
+	slot->variant = variant;
+	slot->streams = streams;
+	slot->handle = d3d11_backend_layout_make(elements, count, vertex_shader);
+	layout_count(slot->handle, types, count);
+	backend_lost_check();
+	return slot->handle;
+}
+
+/* the layouts' line, every 600 frames when more were made: how many, and by
+the Xbox vertex type of their elements */
+static void layouts_say(void)
+{
+	char text[512];
+	size_t length = 0;
+	int type;
+
+	if (!debug_settings.statistics || device.frame % 600 || shaders_met.layouts_made == shaders_met.layouts_said)
+		return;
+	shaders_met.layouts_said = shaders_met.layouts_made;
+	text[0] = 0;
+	for (type = 0; type < 256 && length < sizeof(text) - 32; type++)
+	{
+		if (shaders_met.layout_types[type])
+		{
+			length += (size_t)snprintf(text + length, sizeof(text) - length, "%s%s %lu", length ? ", " : "",
+				vertex_type_name((unsigned long)type) ? vertex_type_name((unsigned long)type) : "other",
+				shaders_met.layout_types[type]);
+		}
+	}
+	platform_log("Direct3D 11: %lu layouts made by the draws; their elements by vertex type: %s",
+		shaders_met.layouts_made, text);
+}
+
+/* ---------- state objects (phase 5)
+
+The draw's blend, depth-stencil and rasterizer state and each sampled
+stage's sampler, from D3D__RenderState and D3D__TextureState as
+apply_raster_state and configure_sampler (d3d8_gl.c) read them. The Xbox's
+values are GL's enumerants (xdk_pdb.h), which GL took as they are: here they
+are translated, entry by entry. Each description is zeroed, filled, and
+handed to the backend for its handle when it differs from the last one of
+its kind (as d3d8_gl.c's gl_state skips a call that changes nothing). A
+part a state does not use is left at fixed values (blending off: ONE, ZERO,
+ADD; no depth test: ALWAYS; no stencil: KEEP, ALWAYS, all bits), so that
+states that draw the same are one object. */
+
+static float dword_float(DWORD value)
+{
+	float result;
+
+	memcpy(&result, &value, sizeof(result));
+	return result;
+}
+
+/* a glBlendFunc factor; for the alpha channel (alpha), the colour factors as
+their alpha ones, which is what GL's alpha channel reads (Direct3D 11 takes
+no colour factor there). The constant's alpha (CONSTANTALPHA) is the blend
+factor, whose colour phase 6 sets from the constant's alpha where the draw
+asks for it. */
+static uint32_t blend_factor(DWORD factor, BOOL alpha)
+{
+	static BOOL unknown_logged;
+
+	switch (factor)
+	{
+	case D3DBLEND_ZERO: return D3D11_BACKEND_BLEND_ZERO;
+	case D3DBLEND_ONE: return D3D11_BACKEND_BLEND_ONE;
+	case D3DBLEND_SRCCOLOR: return alpha ? D3D11_BACKEND_BLEND_SRC_ALPHA : D3D11_BACKEND_BLEND_SRC_COLOR;
+	case D3DBLEND_INVSRCCOLOR: return alpha ? D3D11_BACKEND_BLEND_INV_SRC_ALPHA : D3D11_BACKEND_BLEND_INV_SRC_COLOR;
+	case D3DBLEND_SRCALPHA: return D3D11_BACKEND_BLEND_SRC_ALPHA;
+	case D3DBLEND_INVSRCALPHA: return D3D11_BACKEND_BLEND_INV_SRC_ALPHA;
+	case D3DBLEND_DESTALPHA: return D3D11_BACKEND_BLEND_DEST_ALPHA;
+	case D3DBLEND_INVDESTALPHA: return D3D11_BACKEND_BLEND_INV_DEST_ALPHA;
+	case D3DBLEND_DESTCOLOR: return alpha ? D3D11_BACKEND_BLEND_DEST_ALPHA : D3D11_BACKEND_BLEND_DEST_COLOR;
+	case D3DBLEND_INVDESTCOLOR: return alpha ? D3D11_BACKEND_BLEND_INV_DEST_ALPHA : D3D11_BACKEND_BLEND_INV_DEST_COLOR;
+	case D3DBLEND_SRCALPHASAT: return D3D11_BACKEND_BLEND_SRC_ALPHA_SAT;
+	case D3DBLEND_CONSTANTCOLOR: case D3DBLEND_CONSTANTALPHA: return D3D11_BACKEND_BLEND_BLEND_FACTOR;
+	case D3DBLEND_INVCONSTANTCOLOR: case D3DBLEND_INVCONSTANTALPHA: return D3D11_BACKEND_BLEND_INV_BLEND_FACTOR;
+	default:
+		if (!unknown_logged)
+		{
+			unknown_logged = TRUE;
+			platform_log("Direct3D 11: a blend factor %lu is not one of Direct3D 8's: ONE in its place (logged once)",
+				(unsigned long)factor);
+		}
+		return D3D11_BACKEND_BLEND_ONE;
+	}
+}
+
+/* blend_equation (d3d8_gl.c) */
+static uint32_t blend_operation(DWORD operation)
+{
+	switch (operation)
+	{
+	case D3DBLENDOP_SUBTRACT: return D3D11_BACKEND_BLEND_OP_SUBTRACT;
+	case D3DBLENDOP_REVSUBTRACT:
+	case D3DBLENDOP_REVSUBTRACTSIGNED: return D3D11_BACKEND_BLEND_OP_REV_SUBTRACT;
+	case D3DBLENDOP_MIN: return D3D11_BACKEND_BLEND_OP_MIN;
+	case D3DBLENDOP_MAX: return D3D11_BACKEND_BLEND_OP_MAX;
+	default: return D3D11_BACKEND_BLEND_OP_ADD;
+	}
+}
+
+/* a D3DCMPFUNC (GL's GL_NEVER to GL_ALWAYS, 512 to 519; 0 is GL_NEVER, as
+apply_raster_state reads it) as D3D11_COMPARISON_NEVER (1) to _ALWAYS (8) */
+static uint32_t comparison(DWORD function)
+{
+	if (function >= D3DCMP_NEVER && function <= D3DCMP_ALWAYS)
+		return (uint32_t)(function - D3DCMP_NEVER) + D3D11_BACKEND_COMPARISON_NEVER;
+	return function ? D3D11_BACKEND_COMPARISON_ALWAYS : D3D11_BACKEND_COMPARISON_NEVER;
+}
+
+/* stencil_operation (d3d8_gl.c): GL's GL_INCR and GL_DECR saturate, its
+_WRAP forms are Direct3D's INCR and DECR */
+static uint32_t stencil_operation(DWORD operation)
+{
+	switch (operation)
+	{
+	case D3DSTENCILOP_ZERO: return D3D11_BACKEND_STENCIL_OP_ZERO;
+	case D3DSTENCILOP_REPLACE: return D3D11_BACKEND_STENCIL_OP_REPLACE;
+	case D3DSTENCILOP_INCRSAT: return D3D11_BACKEND_STENCIL_OP_INCR_SAT;
+	case D3DSTENCILOP_DECRSAT: return D3D11_BACKEND_STENCIL_OP_DECR_SAT;
+	case D3DSTENCILOP_INVERT: return D3D11_BACKEND_STENCIL_OP_INVERT;
+	case D3DSTENCILOP_INCR: return D3D11_BACKEND_STENCIL_OP_INCR;
+	case D3DSTENCILOP_DECR: return D3D11_BACKEND_STENCIL_OP_DECR;
+	default: return D3D11_BACKEND_STENCIL_OP_KEEP;
+	}
+}
+
+/* address_mode (d3d8_gl.c) */
+static uint32_t address_mode(DWORD mode)
+{
+	switch (mode)
+	{
+	case D3DTADDRESS_MIRROR: return D3D11_BACKEND_ADDRESS_MIRROR;
+	case D3DTADDRESS_CLAMP: return D3D11_BACKEND_ADDRESS_CLAMP;
+	case D3DTADDRESS_BORDER: return D3D11_BACKEND_ADDRESS_BORDER;
+	case D3DTADDRESS_CLAMPTOEDGE: return D3D11_BACKEND_ADDRESS_CLAMP;
+	default: return D3D11_BACKEND_ADDRESS_WRAP;
+	}
+}
+
+/* apply_raster_state's blending and colour mask */
+static void blend_description(struct d3d11_backend_blend *blend)
+{
+	DWORD *rs = D3D__RenderState;
+	DWORD write = rs[D3DRS_COLORWRITEENABLE];
+	static BOOL constant_alpha_logged;
+
+	memset(blend, 0, sizeof(*blend));
+	if (rs[D3DRS_ALPHABLENDENABLE])
+	{
+		blend->enable = 1;
+		blend->source = blend_factor(rs[D3DRS_SRCBLEND], FALSE);
+		blend->destination = blend_factor(rs[D3DRS_DESTBLEND], FALSE);
+		blend->operation = blend_operation(rs[D3DRS_BLENDOP]);
+		blend->source_alpha = blend_factor(rs[D3DRS_SRCBLEND], TRUE);
+		blend->destination_alpha = blend_factor(rs[D3DRS_DESTBLEND], TRUE);
+		blend->operation_alpha = blend->operation;
+		if (!constant_alpha_logged && (rs[D3DRS_SRCBLEND] == D3DBLEND_CONSTANTALPHA ||
+			rs[D3DRS_SRCBLEND] == D3DBLEND_INVCONSTANTALPHA || rs[D3DRS_DESTBLEND] == D3DBLEND_CONSTANTALPHA ||
+			rs[D3DRS_DESTBLEND] == D3DBLEND_INVCONSTANTALPHA))
+		{
+			constant_alpha_logged = TRUE;
+			platform_log("Direct3D 11: a draw blends by the constant's alpha (source %lu, destination %lu): the blend "
+				"factor's colour is to be its alpha when it is bound (logged once)", (unsigned long)rs[D3DRS_SRCBLEND],
+				(unsigned long)rs[D3DRS_DESTBLEND]);
+		}
+	}
+	else
+	{
+		blend->source = blend->source_alpha = D3D11_BACKEND_BLEND_ONE;
+		blend->destination = blend->destination_alpha = D3D11_BACKEND_BLEND_ZERO;
+		blend->operation = blend->operation_alpha = D3D11_BACKEND_BLEND_OP_ADD;
+	}
+	blend->write_mask = ((write & D3DCOLORWRITEENABLE_RED) ? D3D11_BACKEND_CLEAR_R : 0) |
+		((write & D3DCOLORWRITEENABLE_GREEN) ? D3D11_BACKEND_CLEAR_G : 0) |
+		((write & D3DCOLORWRITEENABLE_BLUE) ? D3D11_BACKEND_CLEAR_B : 0) |
+		((write & D3DCOLORWRITEENABLE_ALPHA) ? D3D11_BACKEND_CLEAR_A : 0);
+}
+
+/* apply_raster_state's depth and stencil, with bind_targets' has_depth */
+static void depth_stencil_description(struct d3d11_backend_depth_stencil *depth, BOOL has_depth)
+{
+	DWORD *rs = D3D__RenderState;
+
+	memset(depth, 0, sizeof(*depth));
+	depth->depth_enable = has_depth && rs[D3DRS_ZENABLE];
+	depth->depth_write = depth->depth_enable && rs[D3DRS_ZWRITEENABLE];
+	depth->depth_function = depth->depth_enable ? comparison(rs[D3DRS_ZFUNC]) : D3D11_BACKEND_COMPARISON_ALWAYS;
+	depth->stencil_enable = has_depth && rs[D3DRS_STENCILENABLE];
+	if (depth->stencil_enable)
+	{
+		depth->stencil_read_mask = rs[D3DRS_STENCILMASK] & 0xff;
+		depth->stencil_write_mask = rs[D3DRS_STENCILWRITEMASK] & 0xff;
+		depth->stencil_fail = stencil_operation(rs[D3DRS_STENCILFAIL]);
+		depth->stencil_depth_fail = stencil_operation(rs[D3DRS_STENCILZFAIL]);
+		depth->stencil_pass = stencil_operation(rs[D3DRS_STENCILPASS]);
+		depth->stencil_function = comparison(rs[D3DRS_STENCILFUNC]);
+	}
+	else
+	{
+		depth->stencil_read_mask = depth->stencil_write_mask = 0xff;
+		depth->stencil_fail = depth->stencil_depth_fail = depth->stencil_pass = D3D11_BACKEND_STENCIL_OP_KEEP;
+		depth->stencil_function = D3D11_BACKEND_COMPARISON_ALWAYS;
+	}
+}
+
+/* apply_raster_state's culling, fill and polygon offset (the desktop
+branch's front face: no flip, "Clip space" in D3D11.md) */
+static void rasterizer_description(struct d3d11_backend_rasterizer *rasterizer)
+{
+	DWORD *rs = D3D__RenderState;
+	static BOOL point_logged;
+
+	memset(rasterizer, 0, sizeof(*rasterizer));
+	rasterizer->fill = rs[D3DRS_FILLMODE] == D3DFILL_WIREFRAME ? D3D11_BACKEND_FILL_WIREFRAME : D3D11_BACKEND_FILL_SOLID;
+	if (rs[D3DRS_FILLMODE] == D3DFILL_POINT && !point_logged)
+	{
+		point_logged = TRUE;
+		platform_log("Direct3D 11: a draw asks for point fill, which Direct3D 11 does not have: solid (logged once)");
+	}
+	if (rs[D3DRS_CULLMODE] == D3DCULL_NONE)
+	{
+		rasterizer->cull = D3D11_BACKEND_CULL_NONE;
+	}
+	else
+	{
+		rasterizer->cull = rs[D3DRS_CULLMODE] == rs[D3DRS_FRONTFACE] ? D3D11_BACKEND_CULL_FRONT : D3D11_BACKEND_CULL_BACK;
+		rasterizer->front_counter_clockwise = rs[D3DRS_FRONTFACE] == D3DFRONT_CCW;
+	}
+	/* D3DRS_ZBIAS is expressed in these (D3DDevice_SetRenderState_ZBias):
+	GL's units and Direct3D's DepthBias both count the depth format's
+	smallest step, so the offset is rounded to them */
+	if (rs[D3DRS_SOLIDOFFSETENABLE])
+	{
+		float slope = dword_float(rs[D3DRS_POLYGONOFFSETZSLOPESCALE]);
+		float offset = dword_float(rs[D3DRS_POLYGONOFFSETZOFFSET]);
+
+		if (offset == offset && offset > -1.0e9f && offset < 1.0e9f)
+			rasterizer->depth_bias = (int32_t)(offset < 0.0f ? offset - 0.5f : offset + 0.5f);
+		rasterizer->slope_scaled_depth_bias = slope == slope && slope > -1.0e30f && slope < 1.0e30f ? slope : 0.0f;
+	}
+	rasterizer->depth_clip = 1;
+	rasterizer->scissor = 1;
+}
+
+/* configure_sampler's inputs (d3d8_gl.c): the stage's state, or the
+high-res HUD texture's filtering */
+#define SAMPLER_STATE_WORDS 11
+
+static void sampler_inputs(int stage, BOOL mipmapped, BOOL hires, DWORD inputs[SAMPLER_STATE_WORDS])
+{
+	DWORD *state = D3D__TextureState[stage];
+
+	inputs[0] = hires ? D3DTEXF_LINEAR : state[D3DTSS_MINFILTER];
+	inputs[1] = hires ? D3DTEXF_LINEAR : mipmapped ? state[D3DTSS_MIPFILTER] : D3DTEXF_NONE;
+	inputs[2] = hires ? D3DTEXF_LINEAR : state[D3DTSS_MAGFILTER];
+	inputs[3] = state[D3DTSS_ADDRESSU];
+	inputs[4] = state[D3DTSS_ADDRESSV];
+	inputs[5] = state[D3DTSS_ADDRESSW];
+	inputs[6] = hires ? 0 : state[D3DTSS_MIPMAPLODBIAS];
+	inputs[7] = hires ? 0 : state[D3DTSS_MAXMIPLEVEL];
+	inputs[8] = state[D3DTSS_MAXANISOTROPY];
+	inputs[9] = state[D3DTSS_BORDERCOLOR];
+	inputs[10] = hires;
+}
+
+/* sampler_parameters (d3d8_gl.c) as a description: the minification
+filter point for POINT and linear otherwise, the magnification the same,
+the mip filter none (NONE: level 0 alone, MinLOD and MaxLOD 0, which is what
+GL's filters without mipmaps read), point (POINT) or linear; anisotropic when
+the minification is ANISOTROPIC and MAXANISOTROPY above 1 (Direct3D 11's
+anisotropic filter is linear in all three); the bias from MIPMAPLODBIAS's
+float, held to Direct3D's range; MinLOD from MAXMIPLEVEL; the border colour
+where an address mode is BORDER */
+static void sampler_description(const DWORD inputs[SAMPLER_STATE_WORDS], struct d3d11_backend_sampler *sampler)
+{
+	DWORD min_filter = inputs[0], mip_filter = inputs[1], mag_filter = inputs[2], anisotropy = inputs[8];
+	float bias = dword_float(inputs[6]);
+
+	memset(sampler, 0, sizeof(*sampler));
+	if (min_filter == D3DTEXF_ANISOTROPIC && anisotropy > 1)
+	{
+		sampler->filter = D3D11_BACKEND_FILTER_ANISOTROPIC;
+		sampler->max_anisotropy = anisotropy < 16 ? (uint32_t)anisotropy : 16;
+	}
+	else
+	{
+		sampler->filter = D3D11_BACKEND_FILTER(min_filter != D3DTEXF_POINT, mag_filter != D3DTEXF_POINT,
+			mip_filter != D3DTEXF_NONE && mip_filter != D3DTEXF_POINT);
+		sampler->max_anisotropy = 1;
+	}
+	sampler->address_u = address_mode(inputs[3]);
+	sampler->address_v = address_mode(inputs[4]);
+	sampler->address_w = address_mode(inputs[5]);
+	sampler->mip_lod_bias = bias == bias ? (bias < -16.0f ? -16.0f : bias > 15.99f ? 15.99f : bias) : 0.0f;
+	sampler->comparison = D3D11_BACKEND_COMPARISON_NEVER;
+	if (mip_filter != D3DTEXF_NONE)
+	{
+		sampler->min_lod = (float)inputs[7];
+		sampler->max_lod = FLT_MAX;
+	}
+	if (sampler->address_u == D3D11_BACKEND_ADDRESS_BORDER || sampler->address_v == D3D11_BACKEND_ADDRESS_BORDER ||
+		sampler->address_w == D3D11_BACKEND_ADDRESS_BORDER)
+	{
+		color_to_vec4(inputs[9], sampler->border_color);
+	}
+}
+
+/* the last description of each kind and its handle (the device asks the
+backend only for one that differs), and each stage's sampler inputs */
+static struct
+{
+	BOOL blend_made, depth_stencil_made, rasterizer_made;
+	struct d3d11_backend_blend blend;
+	struct d3d11_backend_depth_stencil depth_stencil;
+	struct d3d11_backend_rasterizer rasterizer;
+	uint32_t blend_handle, depth_stencil_handle, rasterizer_handle;
+	BOOL sampler_made[D3DTSS_MAXSTAGES];
+	DWORD sampler_inputs[D3DTSS_MAXSTAGES][SAMPLER_STATE_WORDS];
+	uint32_t sampler_handle[D3DTSS_MAXSTAGES];
+} state_objects;
+
+/* bind_targets' has_depth (d3d8_gl.c), without binding: the targets found
+(and made, as there, the first time) and the depth target kept when it is
+one the backend has */
+static BOOL draw_has_depth(void)
+{
+	struct render_target_entry *depth = render_target_get(device.depth_stencil);
+
+	return depth && depth->target.depth && depth->backend_target;
+}
+
+/* the draw's state objects into device.draw */
+static void draw_states(const struct stage_sampling sampling[D3DTSS_MAXSTAGES])
+{
+	struct d3d11_backend_blend blend;
+	struct d3d11_backend_depth_stencil depth_stencil;
+	struct d3d11_backend_rasterizer rasterizer;
+	int stage;
+
+	/* (the colour target found as well, so that bind_targets' entries are
+	made by the draws as d3d8_gl.c makes them) */
+	render_target_get(device.render_target);
+	blend_description(&blend);
+	if (!state_objects.blend_made || !words_equal(&blend, &state_objects.blend, sizeof(blend)))
+	{
+		state_objects.blend = blend;
+		state_objects.blend_handle = d3d11_backend_blend_make(&blend);
+		state_objects.blend_made = TRUE;
+	}
+	depth_stencil_description(&depth_stencil, draw_has_depth());
+	if (!state_objects.depth_stencil_made || !words_equal(&depth_stencil, &state_objects.depth_stencil,
+		sizeof(depth_stencil)))
+	{
+		state_objects.depth_stencil = depth_stencil;
+		state_objects.depth_stencil_handle = d3d11_backend_depth_stencil_make(&depth_stencil);
+		state_objects.depth_stencil_made = TRUE;
+	}
+	rasterizer_description(&rasterizer);
+	if (!state_objects.rasterizer_made || !words_equal(&rasterizer, &state_objects.rasterizer, sizeof(rasterizer)))
+	{
+		state_objects.rasterizer = rasterizer;
+		state_objects.rasterizer_handle = d3d11_backend_rasterizer_make(&rasterizer);
+		state_objects.rasterizer_made = TRUE;
+	}
+	device.draw.blend = state_objects.blend_handle;
+	device.draw.depth_stencil = state_objects.depth_stencil_handle;
+	device.draw.rasterizer = state_objects.rasterizer_handle;
+	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
+	{
+		DWORD inputs[SAMPLER_STATE_WORDS];
+
+		if (!sampling[stage].sampled)
+		{
+			device.draw.samplers[stage] = 0;
+			continue;
+		}
+		sampler_inputs(stage, sampling[stage].mipmapped, sampling[stage].hires, inputs);
+		if (!state_objects.sampler_made[stage] || !words_equal(inputs, state_objects.sampler_inputs[stage],
+			sizeof(inputs)))
+		{
+			struct d3d11_backend_sampler sampler;
+
+			sampler_description(inputs, &sampler);
+			memcpy(state_objects.sampler_inputs[stage], inputs, sizeof(inputs));
+			state_objects.sampler_handle[stage] = d3d11_backend_sampler_make(&sampler);
+			state_objects.sampler_made[stage] = TRUE;
+		}
+		device.draw.samplers[stage] = state_objects.sampler_handle[stage];
+	}
+	backend_lost_check();
+}
+
+/* ---------- the draw's note */
+
 /* a draw past draw_ready: its key and its vertex shader's variant, as
-prepare_draw chooses them (a lit vertex shader that fails is phase 5's: here
-lighting_failed stays FALSE) */
-static void draw_note(BOOL immediate)
+prepare_draw chooses them, their shaders (made now if this run has not made
+them), its layout and its state objects, into device.draw. A lit pair that
+fails sets lighting_failed and logs prepare_draw's line, and the draw takes
+the unlit variant with the key's per_pixel_lighting 0, as there. FALSE if the
+draw is skipped: a shader that failed, or a layout that could not be made
+(counted). */
+static BOOL draw_note(BOOL immediate)
 {
 	struct vertex_shader_object *program = current_program();
 	struct nv2a_pixel_shader_key key;
-	BOOL lit;
+	struct stage_sampling sampling[D3DTSS_MAXSTAGES];
+	struct vertex_variant *variant = NULL;
+	uint32_t vertex = 0, pixel = 0;
 
-	pixel_key_make(&key);
-	lit = program->lighting.lights && !program->lighting_failed && per_pixel_lighting();
-	if (lit)
+	pixel_key_make(&key, sampling);
+	if (program->lighting.lights && !program->lighting_failed && per_pixel_lighting())
+	{
 		key.per_pixel_lighting = (unsigned char)program->lighting.lights;
-	vertex_variant_get(program, immediate, lit);
-	pixel_entry_get(&key);
+		variant = vertex_variant_get(program, immediate, TRUE);
+		vertex = vertex_shader_handle(variant);
+		pixel = pixel_shader_handle(pixel_entry_get(&key));
+		if (!vertex || !pixel)
+		{
+			/* drawn as the vertex shader lights it instead (not at all,
+			were it to fail too) */
+			platform_log("GPU: vertex shader %lu cannot be lit for each pixel here (refer to the shader log above): "
+				"lit for each vertex", program->id);
+			program->lighting_failed = TRUE;
+			key.per_pixel_lighting = 0;
+		}
+	}
+	if (!vertex || !pixel)
+	{
+		variant = vertex_variant_get(program, immediate, FALSE);
+		vertex = vertex_shader_handle(variant);
+		pixel = pixel_shader_handle(pixel_entry_get(&key));
+	}
+	if (!vertex || !pixel)
+	{
+		shaders_met.skipped_no_shader++;
+		return FALSE;
+	}
+	device.draw.vertex_shader = vertex;
+	device.draw.pixel_shader = pixel;
+	device.draw.layout = draw_layout(variant, vertex, immediate);
+	if (!device.draw.layout)
+	{
+		shaders_met.skipped_no_layout++;
+		return FALSE;
+	}
+	draw_states(sampling);
+	return TRUE;
 }
 
 /* the dump's line, every 600 frames when more came */
@@ -2835,6 +3606,107 @@ static void shader_self_test(char *line, size_t line_size)
 	}
 }
 
+/* ---------- the shader service's self-test (debug.d3d11_self_test, fourth
+line)
+
+The backend's cases (d3d11_backend_shaders_self_test: the cache, a failed
+compile, a damaged file, a layout, a state object of each kind), then a
+layout of every vertex type of the format table (attribute_format) over a
+vertex shader the generator makes for it with its masks: sixteen types in one
+declaration, the other three in a second with its thirteen other inputs from
+the attribute slot (vs_4_0 has sixteen inputs). */
+
+static void shader_service_self_test(char *line, size_t line_size)
+{
+	static const unsigned char types[] =
+	{
+		D3DVSDT_FLOAT1, D3DVSDT_FLOAT2, D3DVSDT_FLOAT3, D3DVSDT_FLOAT4, D3DVSDT_FLOAT2H, D3DVSDT_D3DCOLOR,
+		D3DVSDT_SHORT1, D3DVSDT_SHORT2, D3DVSDT_SHORT3, D3DVSDT_SHORT4, D3DVSDT_NORMSHORT1, D3DVSDT_NORMSHORT2,
+		D3DVSDT_NORMSHORT3, D3DVSDT_NORMSHORT4, D3DVSDT_PBYTE1, D3DVSDT_PBYTE2, D3DVSDT_PBYTE3, D3DVSDT_PBYTE4,
+		D3DVSDT_NORMPACKED3,
+	};
+	uint32_t program[SELF_TEST_INSTRUCTIONS][4];
+	uint32_t instruction_count, before, after, statistics[D3D11_BACKEND_STATISTICS];
+	char backend[512];
+	const char *failed = NULL;
+	unsigned long first;
+	int part = 0;
+	size_t length;
+
+	if (!d3d11_backend_shaders_self_test(backend, sizeof(backend)))
+	{
+		snprintf(line, line_size, "%s", backend);
+		return;
+	}
+	instruction_count = self_test_program(program);
+	for (first = 0; !failed && first < sizeof(types); first += XGPU_VERTEX_ATTRIBUTE_COUNT, part++)
+	{
+		struct vertex_shader_object declaration;
+		struct d3d11_backend_layout_element elements[XGPU_VERTEX_ATTRIBUTE_COUNT];
+		unsigned char element_types[XGPU_VERTEX_ATTRIBUTE_COUNT];
+		uint32_t count, vertex, layout;
+		unsigned long index;
+		char *text;
+
+		memset(&declaration, 0, sizeof(declaration));
+		for (index = first; index < sizeof(types) && index < first + XGPU_VERTEX_ATTRIBUTE_COUNT; index++)
+		{
+			struct vertex_element *element = &declaration.elements[declaration.element_count++];
+
+			element->reg = (unsigned char)(index - first);
+			element->stream = (unsigned char)(index % 2);
+			element->type = types[index];
+			element->bytes = (unsigned char)vertex_type_bytes(element->type);
+			/* (each at a multiple of 16: the alignment is not what is tried) */
+			element->offset = (unsigned short)(element->reg / 2 * 16);
+			element_masks(element, &declaration.packed_mask, &declaration.integer_mask,
+				&declaration.three_component_mask);
+		}
+		text = nv2a_hlsl_vertex_shader(&program[0][0], instruction_count, (uint32_t)declaration.packed_mask,
+			(uint32_t)declaration.integer_mask, (uint32_t)declaration.three_component_mask, NULL);
+		if (!text)
+		{
+			failed = "a vertex shader of every type was not generated";
+			break;
+		}
+		{
+			uint64_t hash = shader_hash(SHADER_HASH_START, text, strlen(text));
+
+			vertex = d3d11_backend_shader_find(D3D11_BACKEND_STAGE_VERTEX, hash);
+			if (!vertex)
+				vertex = d3d11_backend_shader_make(D3D11_BACKEND_STAGE_VERTEX, hash, text, strlen(text), HLSL_ENTRY,
+					HLSL_VERTEX_TARGET);
+		}
+		free(text);
+		count = layout_elements(&declaration, 0x3, elements, element_types);
+		d3d11_backend_shaders_statistics(statistics);
+		before = statistics[D3D11_BACKEND_STATISTIC_UNFED_LAYOUTS];
+		layout = vertex ? d3d11_backend_layout_make(elements, count, vertex) : 0;
+		d3d11_backend_shaders_statistics(statistics);
+		after = statistics[D3D11_BACKEND_STATISTIC_UNFED_LAYOUTS];
+		if (!vertex)
+			failed = part ? "the second vertex shader of every type did not compile" :
+				"the first vertex shader of every type did not compile";
+		else if (!layout)
+			failed = part ? "the second layout of every type was not made" : "the first layout of every type was not made";
+		else if (after != before + (part ? 1 : 0))
+			failed = "the second layout's inputs from the attribute slot were not counted";
+	}
+	if (failed)
+	{
+		snprintf(line, line_size, "d3d11: shader service self-test: FAILED (%s)", failed);
+		return;
+	}
+	/* (the backend's line, its parenthesis closed after this part) */
+	snprintf(line, line_size, "%s", backend);
+	length = strlen(line);
+	if (length && line[length - 1] == ')')
+		line[--length] = 0;
+	snprintf(line + length, line_size - length, "; layouts of all %u vertex types of the format table over generated "
+		"vertex shaders, in two streams, the second with %u inputs from the attribute slot)", (unsigned)sizeof(types),
+		(unsigned)(XGPU_VERTEX_ATTRIBUTE_COUNT - (sizeof(types) - XGPU_VERTEX_ATTRIBUTE_COUNT)));
+}
+
 /* prepare_draw's guards (d3d8_gl.c): a draw with no program, no vertex
 shader or no instructions is skipped, as is one debug.gpu_skip_vertex_shaders
 names; and here, a draw with no rings to copy its data into. The rest of
@@ -2888,9 +3760,8 @@ void WINAPI D3DDevice_SetIndices(D3DIndexBuffer *index_data, UINT base_vertex_in
 
 void WINAPI D3DDevice_DrawVertices(D3DPRIMITIVETYPE primitive_type, UINT start_vertex, UINT vertex_count)
 {
-	if (!vertex_count || !draw_ready())
+	if (!vertex_count || !draw_ready() || !draw_note(FALSE))
 		return;
-	draw_note(FALSE);
 	stream_data(start_vertex, vertex_count);
 	if (primitive_type == D3DPT_QUADLIST)
 	{
@@ -2913,9 +3784,8 @@ void WINAPI D3DDevice_DrawIndexedVertices(D3DPRIMITIVETYPE primitive_type, UINT 
 	uint32_t index_segment = 0;
 	BOOL mirrored;
 
-	if (!vertex_count || !index_data || !draw_ready())
+	if (!vertex_count || !index_data || !draw_ready() || !draw_note(FALSE))
 		return;
-	draw_note(FALSE);
 	/* quads are drawn as triangles, from indices made for the draw */
 	mirrored = primitive_type != D3DPT_QUADLIST &&
 		mirror_range((unsigned long)index_data, vertex_count * sizeof(WORD), &index_segment, &index_offset, &generation);
@@ -2973,9 +3843,8 @@ void WINAPI D3DDevice_End(void)
 	D3DPRIMITIVETYPE type = device.immediate_type;
 
 	device.immediate_active = FALSE;
-	if (!count || !draw_ready())
+	if (!count || !draw_ready() || !draw_note(TRUE))
 		return;
-	draw_note(TRUE);
 	/* (the vertices streamed; every attribute four floats, one after
 	another: the immediate vertex array, layout_attribute, vertex_array_get,
 	and the ring bound at the offset this returns, state_vertex_buffer, are
@@ -3271,9 +4140,31 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		the layer) */
 		char layer[64] = "";
 		uint32_t resizes = d3d11_backend_resizes(), discards = d3d11_backend_ring_discards();
+		uint32_t made[D3D11_BACKEND_STATISTICS];
+		int index;
 
 		if (config_boolean("debug.d3d11_debug"))
 			snprintf(layer, sizeof(layer), "; %lu debug layer messages", stats.debug_messages);
+		/* (the shader service's totals since the self-tests: shaders read
+		from the cache and compiled, with the time each took, failed; layouts,
+		those with an input the shader reads from the attribute slot; state
+		objects; and the draws skipped since the start for a shader or a
+		layout) */
+		d3d11_backend_shaders_statistics(made);
+		for (index = 0; index < D3D11_BACKEND_STATISTICS; index++)
+			made[index] -= device.shader_statistics_before[index];
+		platform_log("frame %lu: shaders %lu cached in %.1f ms, %lu compiled in %.1f ms, %lu failed; %lu layouts (%lu "
+			"with inputs from the attribute slot), %lu/%lu/%lu/%lu blend/depth-stencil/rasterizer/sampler states; skipped "
+			"since the start: %lu no shader, %lu no layout", device.frame,
+			(unsigned long)made[D3D11_BACKEND_STATISTIC_CACHED],
+			made[D3D11_BACKEND_STATISTIC_CACHED_MICROSECONDS] / 1000.0,
+			(unsigned long)made[D3D11_BACKEND_STATISTIC_COMPILED],
+			made[D3D11_BACKEND_STATISTIC_COMPILE_MICROSECONDS] / 1000.0,
+			(unsigned long)made[D3D11_BACKEND_STATISTIC_FAILED], (unsigned long)made[D3D11_BACKEND_STATISTIC_LAYOUTS],
+			(unsigned long)made[D3D11_BACKEND_STATISTIC_UNFED_LAYOUTS], (unsigned long)made[D3D11_BACKEND_STATISTIC_BLEND],
+			(unsigned long)made[D3D11_BACKEND_STATISTIC_DEPTH_STENCIL],
+			(unsigned long)made[D3D11_BACKEND_STATISTIC_RASTERIZER], (unsigned long)made[D3D11_BACKEND_STATISTIC_SAMPLERS],
+			shaders_met.skipped_no_shader, shaders_met.skipped_no_layout);
 		platform_log("frame %lu: Direct3D 11 clears only; %lu draws, %lu immediate dropped; skipped in 60 frames: %lu no "
 			"program, %lu no buffer; %lu clears (%lu by clear calls, %lu drawn), %lu target changes, %lu targets; %lu KB "
 			"mirrored, %lu KB streamed, %lu KB uploaded to %lu segments, %lu ring discards; %lu pixel keys, %lu vertex "
@@ -3294,6 +4185,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		memset(&stats, 0, sizeof(stats));
 	}
 	dump_say();
+	layouts_say();
 	platform_pump_events();
 
 	pthread_mutex_lock(&vertical_blank_lock);
