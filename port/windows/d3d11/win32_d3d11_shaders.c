@@ -1016,8 +1016,15 @@ uint32_t d3d11_backend_layout_make(const struct d3d11_backend_layout_element *el
 		release(&layout);
 		return 0;
 	}
+	/* (an input the shader reads that the elements leave out: what phase 6's
+	attribute slot is for; the first few said) */
 	if (shader->inputs_read & ~fed)
-		C.unfed_layouts++;
+	{
+		if (C.unfed_layouts++ < 16)
+			platform_log("d3d11: the layout %u for the vertex shader v%016llx reads inputs from the attribute slot "
+				"(TEXCOORD mask %04x; the elements feed %04x)", handle, (unsigned long long)shader->hash,
+				shader->inputs_read & ~fed, fed);
+	}
 	return handle;
 }
 
