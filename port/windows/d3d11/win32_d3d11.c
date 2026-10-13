@@ -259,7 +259,8 @@ static int choose_adapter(const char *asked, char *why, size_t why_size, char *n
 	}
 	if (*asked)
 	{
-		for (index = 0; IDXGIFactory1_EnumAdapters1(B.factory, index, &adapter) != DXGI_ERROR_NOT_FOUND; index++)
+		/* (to the end of the list, or the first failure of any kind) */
+		for (index = 0; SUCCEEDED(IDXGIFactory1_EnumAdapters1(B.factory, index, &adapter)); index++)
 		{
 			char name[256];
 
@@ -296,23 +297,33 @@ static int create_device(int debug_layer, char *why, size_t why_size, char *laye
 {
 	static const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
 	static const D3D_FEATURE_LEVEL lower_levels[] = { D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
-	UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
+	const D3D_FEATURE_LEVEL *asked = levels;
+	UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT, count = sizeof(levels) / sizeof(levels[0]);
 	HRESULT result;
 
 	snprintf(layer, layer_size, "debug layer off");
-	result = device_at(levels, sizeof(levels) / sizeof(levels[0]), flags | (debug_layer ? D3D11_CREATE_DEVICE_DEBUG : 0));
+	result = device_at(asked, count, flags | (debug_layer ? D3D11_CREATE_DEVICE_DEBUG : 0));
+	/* a runtime without Direct3D 11.1 answers E_INVALIDARG to a list that
+	names 11_1 (Windows 7 without its platform update): asked again at 11_0
+	alone */
+	if (result == E_INVALIDARG)
+	{
+		asked = levels + 1;
+		count = 1;
+		result = device_at(asked, count, flags | (debug_layer ? D3D11_CREATE_DEVICE_DEBUG : 0));
+	}
 	if (debug_layer && result == DXGI_ERROR_SDK_COMPONENT_MISSING)
 	{
 		snprintf(layer, layer_size, "debug layer missing (DXGI_ERROR_SDK_COMPONENT_MISSING; install the Graphics "
 			"Tools feature)");
 		debug_layer = 0;
-		result = device_at(levels, sizeof(levels) / sizeof(levels[0]), flags);
+		result = device_at(asked, count, flags);
 	}
 	if (FAILED(result))
 	{
 		/* below 11_0 (no level asked for is there): asked again only to name
 		the level the adapter has */
-		if ((result == DXGI_ERROR_UNSUPPORTED || result == E_INVALIDARG) &&
+		if (result == DXGI_ERROR_UNSUPPORTED &&
 			SUCCEEDED(device_at(lower_levels, sizeof(lower_levels) / sizeof(lower_levels[0]), flags)))
 		{
 			snprintf(why, why_size, "feature level %s is below 11_0", level_name(B.level));

@@ -71,7 +71,7 @@ same saved games. These settings apply only to `halo_d3d11.exe`:
 | `display.d3d11_adapter` | `""` | `HALO_D3D11_ADAPTER` | The graphics adapter. Empty for the fastest GPU, `"warp"` for the software renderer of Microsoft, or a part of the name of an adapter. If no adapter has that name, the executable uses the fastest GPU. |
 | `debug.d3d11_debug` | `false` | `HALO_D3D11_DEBUG` | Writes the messages of the Direct3D debug layer to the log. The debug layer is in the Graphics Tools feature of Windows (Settings, Optional features). |
 
-The log of the port starts with a `renderer:` line. This line gives the
+The log of the port has a `renderer:` line. This line gives the
 adapter, the feature level, the version of the driver and the state of the
 debug layer, or the reason why Direct3D 11 is not available.
 
