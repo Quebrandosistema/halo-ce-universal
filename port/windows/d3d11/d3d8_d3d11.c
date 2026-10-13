@@ -2458,8 +2458,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 
 		if (config_boolean("debug.d3d11_debug"))
 			snprintf(layer, sizeof(layer), "; %lu debug layer messages", stats.debug_messages);
-		platform_log("frame %lu: Direct3D 11 clears only; %lu draws, %lu immediate dropped, skipped %lu no program, "
-			"%lu no buffer; %lu clears (%lu by clear calls, %lu drawn), %lu target changes, %lu targets; %lu KB "
+		platform_log("frame %lu: Direct3D 11 clears only; %lu draws, %lu immediate dropped; skipped in 60 frames: %lu no "
+			"program, %lu no buffer; %lu clears (%lu by clear calls, %lu drawn), %lu target changes, %lu targets; %lu KB "
 			"mirrored, %lu KB streamed, %lu KB uploaded to %lu segments, %lu ring discards; %lu presented, %lu not; "
 			"%lu swap chain resizes; %lu GL stub calls%s",
 			device.frame, stats.draws / stats.presents, stats.immediate_draws / stats.presents,

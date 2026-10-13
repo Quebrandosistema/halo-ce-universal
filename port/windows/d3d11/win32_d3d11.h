@@ -117,7 +117,8 @@ struct target
 };
 
 /* a colour (B8G8R8A8_UNORM) or depth target made and cleared once; 0 if it
-was not made (logged) */
+was not made (logged). (These three are defined in win32_d3d11.c under their
+d3d11_backend_ names; the short names are macros for the backend's units.) */
 int d3d11_backend_target_make(struct target *target, uint32_t width, uint32_t height, int depth);
 #define target_make d3d11_backend_target_make
 void d3d11_backend_target_free(struct target *target);

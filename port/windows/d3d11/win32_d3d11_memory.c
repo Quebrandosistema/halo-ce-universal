@@ -563,8 +563,13 @@ int d3d11_backend_memory_self_test(char *line, size_t line_size)
 				break;
 			case 3:
 				/* a segment through the upload ring: red, then green at the
-				same offset, both copies queued before anything is read */
+				same offset, both copies queued before anything is read; the
+				green write wraps the upload ring (its offset set to the end
+				first), so its storage is discarded while the red copy from
+				the old storage is still queued */
 				test_fill(vertices, 3, colour);
+				if (pass)
+					M.upload_offset = M.upload.size;
 				written = buffer_write(segment, 256, vertices, 48);
 				if (written)
 					test_draw(&targets[pass], segment, 256, NULL, 0);
@@ -618,7 +623,7 @@ int d3d11_backend_memory_self_test(char *line, size_t line_size)
 	}
 	if (ok)
 		snprintf(line, line_size, "d3d11: memory self-test: ok (the stream ring appended and across a discard, a "
-			"segment through the upload ring rewritten in place, the index ring: %d draws, each the colour its bytes "
+			"segment through the upload ring rewritten in place and across its wrap, the index ring: %d draws, each the colour its bytes "
 			"had at the draw)", draws);
 
 	/* nothing of the test's left bound; its objects released. The rings and

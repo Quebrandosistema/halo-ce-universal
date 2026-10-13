@@ -686,7 +686,7 @@ static struct target *bound_color, *bound_depth;
 static ID3D11Texture2D *staging;
 static uint32_t staging_width, staging_height;
 
-void target_free(struct target *target)
+void d3d11_backend_target_free(struct target *target)
 {
 	release(&target->view);
 	release(&target->depth);
@@ -694,7 +694,7 @@ void target_free(struct target *target)
 	release(&target->texture);
 }
 
-int target_make(struct target *target, uint32_t width, uint32_t height, int depth)
+int d3d11_backend_target_make(struct target *target, uint32_t width, uint32_t height, int depth)
 {
 	static const float black[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 	D3D11_TEXTURE2D_DESC description;
@@ -945,7 +945,7 @@ uint32_t d3d11_backend_clear(uint32_t channels, const float color[4], float z, u
 
 /* ---------- the read-back */
 
-int read_target(struct target *target, void *pixels, size_t size)
+int d3d11_backend_read_target(struct target *target, void *pixels, size_t size)
 {
 	D3D11_TEXTURE2D_DESC description;
 	D3D11_MAPPED_SUBRESOURCE mapped;
