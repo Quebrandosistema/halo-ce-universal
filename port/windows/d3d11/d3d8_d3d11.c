@@ -2351,8 +2351,8 @@ static struct
 	could not be made, since the start */
 	unsigned long skipped_no_shader, skipped_no_layout;
 	/* the layouts the draws made (the backend's handles above layouts_seen
-	are new), counted by the Xbox vertex type of their elements, and the
-	count when the log last said */
+	are new), how many use each Xbox vertex type, and the count when the log
+	last said */
 	uint32_t layouts_seen;
 	unsigned long layouts_made, layouts_said;
 	unsigned long layout_types[256];
@@ -2770,10 +2770,11 @@ static uint32_t layout_elements(const struct vertex_shader_object *declaration, 
 	return count;
 }
 
-/* a layout the backend answered: counted by its elements' types if it is
-new */
+/* a layout the backend answered, if it is new: counted under each Xbox type
+its elements have (once a type) */
 static void layout_count(uint32_t handle, const unsigned char *types, uint32_t count)
 {
+	BOOL counted[256] = { FALSE };
 	uint32_t index;
 
 	/* (the self-tests' layouts are not the draws') */
@@ -2784,7 +2785,11 @@ static void layout_count(uint32_t handle, const unsigned char *types, uint32_t c
 	shaders_met.layouts_seen = handle;
 	shaders_met.layouts_made++;
 	for (index = 0; index < count; index++)
-		shaders_met.layout_types[types[index]]++;
+	{
+		if (!counted[types[index]])
+			shaders_met.layout_types[types[index]]++;
+		counted[types[index]] = TRUE;
+	}
 }
 
 /* the streams the declaration reads that have data (stream_data's test) */
@@ -2850,8 +2855,8 @@ static uint32_t draw_layout(struct vertex_variant *variant, uint32_t vertex_shad
 	return slot->handle;
 }
 
-/* the layouts' line, every 600 frames when more were made: how many, and by
-the Xbox vertex type of their elements */
+/* the layouts' line, every 600 frames when more were made: how many, and how
+many use each Xbox vertex type */
 static void layouts_say(void)
 {
 	char text[512];
@@ -2871,7 +2876,7 @@ static void layouts_say(void)
 				shaders_met.layout_types[type]);
 		}
 	}
-	platform_log("Direct3D 11: %lu layouts made by the draws; their elements by vertex type: %s",
+	platform_log("Direct3D 11: %lu layouts made by the draws; the layouts using each vertex type: %s",
 		shaders_met.layouts_made, text);
 }
 
