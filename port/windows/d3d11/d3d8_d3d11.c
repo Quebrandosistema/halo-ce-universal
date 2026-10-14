@@ -352,6 +352,10 @@ struct vertex_element
 	unsigned char type;
 	unsigned char bytes;
 	unsigned short offset;
+	/* where the element is in the vertices the input layout reads: its
+	offset, or, in a stream of the declaration's repacked_streams, an offset
+	its format is aligned at (declaration_pack) */
+	unsigned short packed_offset;
 };
 
 struct vertex_variant;
@@ -403,6 +407,11 @@ struct vertex_shader_object
 	/* a stream of a stride its elements' formats do not align with was
 	copied at another (stream_data), said once for the declaration */
 	BOOL stride_logged;
+	/* the streams with an element at an offset its format is not aligned
+	at, which Direct3D 11's input layouts refuse (the debug layer's error
+	159; a30's R8G8B8A8 colour at byte 3): their vertices are copied with each
+	element at its packed_offset (declaration_pack, stream_data) */
+	unsigned long repacked_streams;
 };
 
 /* ---------- the device */
@@ -1592,6 +1601,55 @@ static void element_masks(const struct vertex_element *element, unsigned long *p
 		*three_component_mask |= 1UL << element->reg;
 }
 
+static unsigned long format_bytes(unsigned long type);
+
+/* the alignment Direct3D 11 asks of an element's offset: its format's size,
+at most 4 (CreateInputLayout's AlignedByteOffset) */
+static unsigned long format_alignment(unsigned long type)
+{
+	unsigned long bytes = format_bytes(type);
+
+	return bytes < 4 ? bytes : 4;
+}
+
+/* each element's packed_offset: its offset, but in a stream where an
+element's offset is not aligned for its format, where each element of the
+stream goes, in order, at the next offset its format is aligned at, with
+room for the bytes the layout reads (format_bytes) */
+static void declaration_pack(struct vertex_shader_object *object)
+{
+	unsigned long index, stream;
+
+	object->repacked_streams = 0;
+	for (index = 0; index < object->element_count; index++)
+	{
+		struct vertex_element *element = &object->elements[index];
+
+		element->packed_offset = element->offset;
+		if (element->type != D3DVSDT_NONE && element->offset % format_alignment(element->type))
+			object->repacked_streams |= 1UL << element->stream;
+	}
+	for (stream = 0; stream < 16; stream++)
+	{
+		unsigned long next = 0;
+
+		if (!(object->repacked_streams & (1UL << stream)))
+			continue;
+		for (index = 0; index < object->element_count; index++)
+		{
+			struct vertex_element *element = &object->elements[index];
+			unsigned long alignment;
+
+			if (element->stream != stream || element->type == D3DVSDT_NONE)
+				continue;
+			alignment = format_alignment(element->type);
+			next = (next + alignment - 1) / alignment * alignment;
+			element->packed_offset = (unsigned short)next;
+			next += format_bytes(element->type);
+		}
+	}
+}
+
 static void parse_declaration(struct vertex_shader_object *object, const DWORD *declaration)
 {
 	unsigned long stream = 0;
@@ -1638,6 +1696,7 @@ static void parse_declaration(struct vertex_shader_object *object, const DWORD *
 			break;
 		}
 	}
+	declaration_pack(object);
 }
 
 HRESULT WINAPI D3DDevice_CreateVertexShader(CONST DWORD *declaration, CONST DWORD *function, DWORD *handle, DWORD usage)
@@ -2077,10 +2136,12 @@ static unsigned long format_bytes(unsigned long type)
 
 /* a stream whose stride is not a multiple of 4, which Direct3D 11's input
 assembler wants of a vertex buffer that an element reads (the debug layer's
-error 367), and the stride its vertices are copied at instead: the bytes its
-elements read, rounded up to 4. The zsprites' texture coordinates are such a
-stream (two bytes a vertex, rasterizer_xbox_transparent_geometry.c), which GL
-read as they are. 0 when the stride is a multiple of 4 (or 0). */
+error 367), or whose elements are repacked (declaration_pack), and the
+stride its vertices are copied at instead: the bytes its elements read, at
+their packed offsets, rounded up to 4. The zsprites' texture coordinates are
+such a stream (two bytes a vertex, rasterizer_xbox_transparent_geometry.c),
+which GL read as they are. 0 when the stride is a multiple of 4 (or 0) and
+the elements are where they are. */
 static unsigned long stream_aligned_stride(const struct vertex_shader_object *declaration, unsigned long stream,
 	unsigned long stride, unsigned long *span)
 {
@@ -2093,11 +2154,11 @@ static unsigned long stream_aligned_stride(const struct vertex_shader_object *de
 
 		if (element->stream != stream || element->type == D3DVSDT_NONE)
 			continue;
-		if (element->offset + bytes > end)
-			end = element->offset + bytes;
+		if (element->packed_offset + bytes > end)
+			end = element->packed_offset + bytes;
 	}
 	*span = end;
-	if (!stride || stride % 4 == 0)
+	if (!(declaration->repacked_streams & (1UL << stream)) && (!stride || stride % 4 == 0))
 		return 0;
 	return (end + 3) & ~3UL;
 }
@@ -2139,9 +2200,11 @@ static void stream_data(unsigned long first, unsigned long count)
 			{
 				declaration->stride_logged = TRUE;
 				platform_log("Direct3D 11: stream %lu of stride %lu under declaration %lu (vertex shader %lu), whose "
-					"elements read %lu bytes of each vertex: its vertices are copied at a stride of %lu (logged once a "
+					"elements read %lu bytes of each vertex%s: its vertices are copied at a stride of %lu (logged once a "
 					"declaration)", stream, stride, declaration->id, current_program() ? current_program()->id : 0,
-					spans[stream], aligned_strides[stream]);
+					spans[stream], (declaration->repacked_streams & (1UL << stream)) ?
+					", one at an offset its format is not aligned at, so each at an aligned offset" : "",
+					aligned_strides[stream]);
 			}
 			total += (aligned_strides[stream] * count + 15) & ~15UL;
 			continue;
@@ -2167,7 +2230,29 @@ static void stream_data(unsigned long first, unsigned long count)
 			unsigned long aligned = aligned_strides[stream], available = stride * count, vertex;
 			unsigned char *copy = calloc(count, aligned);
 
-			if (copy)
+			if (copy && (declaration->repacked_streams & (1UL << stream)))
+			{
+				/* (each element's bytes from its offset to its packed one) */
+				for (vertex = 0; vertex < count; vertex++)
+				{
+					unsigned long at = vertex * stride, other;
+
+					for (other = 0; other < declaration->element_count; other++)
+					{
+						const struct vertex_element *moved = &declaration->elements[other];
+						unsigned long bytes = moved->bytes;
+
+						if (moved->stream != stream || moved->type == D3DVSDT_NONE || at + moved->offset >= available)
+							continue;
+						if (at + moved->offset + bytes > available)
+							bytes = available - at - moved->offset;
+						memcpy(copy + vertex * aligned + moved->packed_offset, base + at + moved->offset, bytes);
+					}
+				}
+				stream_offsets[stream] = stream_upload(copy, aligned * count);
+				free(copy);
+			}
+			else if (copy)
 			{
 				for (vertex = 0; vertex < count; vertex++)
 				{
@@ -2995,7 +3080,7 @@ static uint32_t layout_elements(const struct vertex_shader_object *declaration, 
 		elements[count].semantic_index = (uint32_t)index;
 		elements[count].format = attribute_format(element->type);
 		elements[count].slot = element->stream;
-		elements[count].offset = element->offset;
+		elements[count].offset = element->packed_offset;
 		types[count] = element->type;
 		count++;
 	}
