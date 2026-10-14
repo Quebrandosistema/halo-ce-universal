@@ -468,6 +468,49 @@ draw sets everything (the backend calls it itself after the clears, the
 present, the passes and the self-tests, which bind behind the draws) */
 void d3d11_backend_state_forget(void);
 
+/* ---------- textures (win32_d3d11_textures.c)
+
+The game's textures, made and written by the device's copy of the texture
+cache (xbox_textures_d3d11.c): 2D, 3D or cube, in one of the formats below
+(every other Xbox format is decoded to BGRA8 by the copy), with every mip
+level; the texels copied during the write. Handles count from 1 and a freed
+one is reused. */
+#define D3D11_BACKEND_TEXTURE_KIND_2D 1u
+#define D3D11_BACKEND_TEXTURE_KIND_3D 2u
+#define D3D11_BACKEND_TEXTURE_KIND_CUBE 3u
+/* DXGI_FORMAT's numbers, checked by the backend */
+#define D3D11_BACKEND_TEXTURE_FORMAT_RGBA8 28u
+#define D3D11_BACKEND_TEXTURE_FORMAT_BC1 71u
+#define D3D11_BACKEND_TEXTURE_FORMAT_BC2 74u
+#define D3D11_BACKEND_TEXTURE_FORMAT_BC3 77u
+#define D3D11_BACKEND_TEXTURE_FORMAT_BGRA8 87u
+
+struct d3d11_backend_texture
+{
+	uint32_t kind, format;
+	uint32_t width, height, depth, levels;
+	/* the levels below 0 made by the device (GenerateMips) after level 0 is
+	written: the texture is made for it */
+	uint32_t generate_mips;
+};
+
+/* the texture, with a shader resource view over every level; its handle,
+or 0 if it could not be made (logged once) */
+uint32_t d3d11_backend_texture_create(const struct d3d11_backend_texture *description);
+/* face (0, or a cube's 0 to 5) and level written with the texels at
+row_pitch bytes a row and slice_pitch a slice (UpdateSubresource): the whole
+subresource, or the box (left, top, right, bottom) of it; 1 if written */
+int d3d11_backend_texture_write(uint32_t handle, uint32_t face, uint32_t level, const void *texels, uint32_t row_pitch,
+	uint32_t slice_pitch, const uint32_t *box);
+/* the levels below 0 from level 0, for a texture made with generate_mips */
+void d3d11_backend_texture_generate_mips(uint32_t handle);
+/* level 0 of a 2D texture of an uncompressed format, rows from the top as
+the texture holds them (BGRA or RGBA), width * 4 bytes each; 1 if read */
+int d3d11_backend_texture_read(uint32_t handle, void *pixels, size_t size);
+void d3d11_backend_texture_free(uint32_t handle);
+/* how many textures exist, and the bytes they hold */
+uint32_t d3d11_backend_textures_alive(uint32_t *bytes);
+
 /* what d3d11_backend_draw_statistics fills, totals since the start: the
 draws made; the binds the shadow skipped; the copies of a target sampled
 while it is drawn into; the textures' writes and their bytes; the textures

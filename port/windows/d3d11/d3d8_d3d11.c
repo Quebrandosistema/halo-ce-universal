@@ -66,6 +66,11 @@ and configure_sampler read them. The handles are kept in device.draw for phase
 6 to bind; nothing is bound or drawn yet. debug.d3d11_self_test's fourth line
 is the service's.
 
+Phase 6, step 2: the textures through the texture cache's copy
+(xbox_textures_d3d11.c, xgpu_d3d11_texture_get: the handle, the kind and the
+description, with the high-res flags the cache answers), bound through the
+record; the cache's frame at Present; the texture statistics.
+
 Phase 6: the draw. prepare_draw (d3d8_gl.c) is back whole in draw_note's
 place as draw_prepare, in its order, with the backend's calls where the GL
 was: the key and the textures, the targets after them (bind_targets), the
@@ -91,9 +96,9 @@ the pixel entry's identity). trace_draw is back as it is.
 #include "sdl_platform.h"
 #include "halo_ui_pointer.h"
 #include "port_config.h"
-#include "hud_hires.h"
 #include "d3d11_backend.h"
 #include "hlsl_shaders.h"
+#include "xbox_textures_d3d11.h"
 
 /* the GL calls counted by the stubs since the start (build/windows/gl_stubs.c) */
 unsigned long gl_stubs_calls(void);
@@ -494,7 +499,7 @@ and the debug layer's messages */
 static struct
 {
 	unsigned long draws, immediate_draws, clears, presents;
-	unsigned long skipped_no_program, skipped_no_buffer, skipped_no_target, skipped_textures, skipped_not_drawn;
+	unsigned long skipped_no_program, skipped_no_buffer, skipped_no_target, skipped_not_drawn;
 	unsigned long clears_by_calls, clears_drawn;
 	unsigned long target_changes;
 	/* vertex and index bytes drawn from the mirror, and streamed (as
@@ -2303,18 +2308,18 @@ struct stage_sampling
 	BOOL sampled, mipmapped, hires;
 };
 
-/* bind_textures' decisions for the key, without GL (d3d8_gl.c): a stage with
-no texture, or in modes 0, 0x04, 0x05, has no sampler, and in mode 0x11 a 2D
-one; a render target the stage samples is 2D; otherwise the texture's own
-type, a cube map's a cube and a volume's 3D. Stage 0's coverage_alpha and
-point_threshold are its high-res HUD texture's (hud_hires.h), found as the
-texture cache finds it when it uploads the bitmap (xbox_textures.c), without
-the decode: the bitmap's address, sizes and first level's bytes, not
-palettized, not a cube map or a volume. Each stage's sampling as
-configure_sampler is given it: a render target's levels only where
-bind_textures composites its mip chain (mip_composite_get), a bitmap's from
-its description, and high-res where the HUD has a texture for it (on any
-stage, as xbox_textures.c finds it). */
+/* bind_textures' decisions for the key and the record (d3d8_gl.c): a stage
+with no texture, or in modes 0, 0x04, 0x05, has no sampler, and in mode 0x11
+a 2D one; a render target the stage samples is 2D (the target's handle in
+the record, its linear scale from the target's size); otherwise the texture
+cache's copy (xbox_textures_d3d11.c) gives the texture's handle, its kind (a
+cube map's a cube, a volume's 3D) and its description, with the high-res
+flags as the cache answers them (a text atlas's, a menu art's or a HUD
+override's). Stage 0's coverage_alpha and point_threshold are the
+description's. Each stage's sampling as configure_sampler is given it: a
+render target's levels only where bind_textures composites its mip chain
+(mip_composite_get), a bitmap's from its description, and high-res where the
+cache says so (on any stage, as xbox_textures.c finds it). */
 static void key_textures(struct nv2a_pixel_shader_key *key, struct stage_sampling sampling[D3DTSS_MAXSTAGES],
 	float texture_scale[D3DTSS_MAXSTAGES][4])
 {
@@ -2357,24 +2362,30 @@ static void key_textures(struct nv2a_pixel_shader_key *key, struct stage_samplin
 			}
 			continue;
 		}
-		xgpu_texture_describe(texture->Format, texture->Size, &description);
-		sampling[stage].mipmapped = description.levels > 1;
-		if (((texture->Format & D3DFORMAT_FORMAT_MASK) >> D3DFORMAT_FORMAT_SHIFT) != 0x0b &&
-			!description.cube_map && description.depth == 1)
 		{
-			long override = hud_hires_override_find((unsigned long)PLATFORM_PHYSICAL_TO_VIRTUAL(texture->Data),
-				description.width, description.height, description.levels > 1 ?
-				xgpu_texture_level_offset(&description, 1) : xgpu_texture_face_size(&description));
+			const D3DCOLOR *palette = device.palettes[stage] && device.palettes[stage]->Data ?
+				(const D3DCOLOR *)PLATFORM_PHYSICAL_TO_VIRTUAL(device.palettes[stage]->Data) : NULL;
+			struct xgpu_d3d11_texture result;
 
-			sampling[stage].hires = override >= 0;
+			xgpu_d3d11_texture_get((const DWORD *)texture, palette, &result);
+			description = result.description;
+			if (description.linear)
+			{
+				texture_scale[stage][0] = 1.0f / (float)description.width;
+				texture_scale[stage][1] = 1.0f / (float)description.height;
+			}
+			device.draw.textures[stage].kind = D3D11_BACKEND_TEXTURE_CACHE;
+			device.draw.textures[stage].handle = result.handle;
+			sampling[stage].mipmapped = description.levels > 1;
+			sampling[stage].hires = description.hires;
 			if (stage == 0)
 			{
-				key->coverage_alpha = override >= 0 && hud_hires_override_coverage(override);
-				key->point_threshold = override >= 0 && hud_hires_override_point_threshold(override);
+				key->coverage_alpha = description.hires_coverage != FALSE;
+				key->point_threshold = description.hires_point_threshold != FALSE;
 			}
+			key->sampler_type[stage] = result.kind == D3D11_BACKEND_TEXTURE_KIND_CUBE ? _xgpu_sampler_cube :
+				result.kind == D3D11_BACKEND_TEXTURE_KIND_3D ? _xgpu_sampler_3d : _xgpu_sampler_2d;
 		}
-		key->sampler_type[stage] = description.cube_map ? _xgpu_sampler_cube :
-			description.depth > 1 ? _xgpu_sampler_3d : _xgpu_sampler_2d;
 	}
 }
 
@@ -3579,9 +3590,8 @@ the two shaders (made now if this run has not made them; a lit pair that
 fails sets lighting_failed and logs prepare_draw's line, and the draw takes
 the unlit variant with the key's per_pixel_lighting 0, as there), its
 layout, its state objects, the constant buffers, and the record's dynamic
-values and attribute slot. FALSE if the draw is skipped (counted): a stage
-with a texture (until step 2), no target, a shader that failed, a layout
-that could not be made. */
+values and attribute slot. FALSE if the draw is skipped (counted): no
+target, a shader that failed, a layout that could not be made. */
 static BOOL draw_prepare(BOOL immediate)
 {
 	struct vertex_shader_object *program = current_program();
@@ -3595,16 +3605,6 @@ static BOOL draw_prepare(BOOL immediate)
 	int stage;
 
 	pixel_key_make(&key, sampling, texture_scale);
-	/* (step 1: a draw with a texture is skipped until the texture cache
-	comes, step 2) */
-	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
-	{
-		if (sampling[stage].sampled)
-		{
-			stats.skipped_textures++;
-			return FALSE;
-		}
-	}
 	/* the targets after the textures: a render target the draw samples has
 	its multisampled pixels resolved first, and the back buffer can be both
 	sampled and drawn into (the backend samples a copy then) */
@@ -4612,6 +4612,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			presented = d3d11_backend_present(back_buffer->backend_target,
 				(uint32_t)(window_width > 0 ? window_width : 0), (uint32_t)(window_height > 0 ? window_height : 0),
 				device.vsync ? 1 : 0);
+			xgpu_d3d11_texture_cache_begin_frame();
 		}
 		stats.debug_messages += d3d11_backend_drain_debug();
 		backend_lost_check();
@@ -4667,12 +4668,13 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			(unsigned long)made[D3D11_BACKEND_STATISTIC_RASTERIZER], (unsigned long)made[D3D11_BACKEND_STATISTIC_SAMPLERS],
 			shaders_met.skipped_no_shader, shaders_met.skipped_no_layout);
 		platform_log("frame %lu: Direct3D 11; %lu draws, %lu immediate; skipped in 60 frames: %lu no "
-			"program, %lu no buffer, %lu no target, %lu textures, %lu not drawn; %lu clears (%lu by clear calls, %lu drawn), "
+			"program, %lu no buffer, %lu no target, %lu not drawn; %lu clears (%lu by clear calls, %lu drawn), "
 			"%lu target changes, %lu targets; %lu KB mirrored, %lu KB streamed, %lu KB uploaded to %lu segments, %lu ring "
-			"discards; %lu binds skipped, %lu self-sampling copies; %lu pixel keys, %lu vertex variants met; %lu presented, "
+			"discards; %lu binds skipped, %lu self-sampling copies; %lu textures (%lu KB), %lu texture writes (%lu KB); "
+			"%lu pixel keys, %lu vertex variants met; %lu presented, "
 			"%lu not; %lu swap chain resizes; %lu GL stub calls%s",
 			device.frame, stats.draws / stats.presents, stats.immediate_draws / stats.presents,
-			stats.skipped_no_program, stats.skipped_no_buffer, stats.skipped_no_target, stats.skipped_textures,
+			stats.skipped_no_program, stats.skipped_no_buffer, stats.skipped_no_target,
 			stats.skipped_not_drawn,
 			stats.clears / stats.presents, stats.clears_by_calls / stats.presents, stats.clears_drawn / stats.presents,
 			stats.target_changes / stats.presents, (unsigned long)d3d11_backend_targets_alive(),
@@ -4683,6 +4685,12 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_BINDS_SKIPPED]),
 			(unsigned long)(drawn[D3D11_BACKEND_DRAW_STATISTIC_SELF_SAMPLING_COPIES] -
 				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_SELF_SAMPLING_COPIES]),
+			(unsigned long)drawn[D3D11_BACKEND_DRAW_STATISTIC_TEXTURES_ALIVE],
+			(unsigned long)drawn[D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_BYTES] / 1024,
+			(unsigned long)(drawn[D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_WRITES] -
+				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_WRITES]),
+			(unsigned long)(drawn[D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_WRITE_BYTES] -
+				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_WRITE_BYTES]) / 1024,
 			shaders_met.pixel_keys, shaders_met.vertex_variants,
 			stats.presented,
 			stats.not_presented, (unsigned long)(resizes - device.resizes_before),

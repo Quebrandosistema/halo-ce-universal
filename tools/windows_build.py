@@ -450,8 +450,9 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
                 add_object(source, f"{platform_cflags} {updater_defines(getattr(sln, 'port_release', False))}")
             else:
                 add_object(source, platform_cflags)
-            # (the device, display.anti_aliasing's passes and the GL entry points)
-            if source.name in ("d3d8_gl.c", "xgpu_post.c", "gl_functions.c"):
+            # (the device, the texture cache, display.anti_aliasing's passes
+            # and the GL entry points)
+            if source.name in ("d3d8_gl.c", "xbox_textures.c", "xgpu_post.c", "gl_functions.c"):
                 gl_objects.append(objects[-1])
         miniupnpc_include = f"-I{MINIUPNPC_DIR / 'include'} -DMINIUPNP_STATICLIB"
         for source in sorted((PORT_DIR / "src").glob("*.c")):
@@ -512,7 +513,7 @@ def generate_windows_build(n: Writer, sln: Any) -> None:
         # (win32_* against the Windows SDK, the rest against the Xbox SDK, as
         # port/windows/src's), and the GL entry points the shared files still
         # call by counted stubs generated from gl.h's list (build/windows/gl_stubs.c)
-        if len(gl_objects) != 3:
+        if len(gl_objects) != 4:
             sys.exit(f"the OpenGL renderer's objects were not all found: {gl_objects}")
         d3d11_objects = [obj for obj in objects if obj not in gl_objects]
         for source in sorted((PORT_DIR / "d3d11").glob("*.c")):
