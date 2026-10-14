@@ -346,7 +346,7 @@ unsigned int text_hires_atlas_texture(unsigned long data)
 	return atlas_texture;
 }
 
-#if defined(HALO_SWITCH) || defined(HALO_ANDROID)
+#if defined(HALO_SWITCH) || defined(HALO_ANDROID) || defined(_WIN32)
 const unsigned char *text_hires_atlas_rows(unsigned long data, long *size, int all, long *top, long *bottom)
 {
 	if (!data || data != placeholder_data || !atlas)

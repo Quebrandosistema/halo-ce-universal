@@ -350,7 +350,7 @@ unsigned int hud_hires_png_texture(const void *png, unsigned long size, unsigned
 	return texture;
 }
 
-#if defined(HALO_SWITCH) || defined(HALO_ANDROID)
+#if defined(HALO_SWITCH) || defined(HALO_ANDROID) || defined(_WIN32)
 unsigned char *hud_hires_png_pixels(const void *png, unsigned long size, unsigned long *width, unsigned long *height)
 {
 	*width = *height = 0;

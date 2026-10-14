@@ -60,12 +60,16 @@ The game finds the game data as on Linux. Refer to "Start the game" in
 `ninja windows` also makes `build\windows\halo_d3d11.exe`. This executable
 is the same game with a renderer that uses Direct3D 11 instead of OpenGL. The
 renderer is in development: refer to [D3D11.md](D3D11.md). At this time the
-window shows only the clears of the game: the plain colours that the game
-fills its screen with before it draws. The renderer copies the vertices and
-the indices of each draw of the game into Direct3D buffers, and makes the
-shaders, the input layout and the state objects of each draw, but it does
-not draw them yet. The menus, the game, the sound and the input operate,
-but the executable draws nothing else. To play, use `halo.exe`.
+executable draws the menus (the PC menus and the Xbox menus, with their
+art and their text) as `halo.exe` draws them, and the maps' geometry and
+textures; the render targets that the maps sample (the wake-up flash, the
+shadows, the water), the anti-aliasing passes and the visibility tests of
+the lens flares are the next steps. The settings `display.anti_aliasing`,
+`display.resolution_scaling`, `display.shadow_resolution`,
+`display.high_res_hud`, `display.high_res_text`, `display.menus`,
+`display.per_pixel_lighting`, `debug.texture_log`, `debug.texture_no_cache`,
+`debug.texture_dump_directory`, `debug.gpu_trace_frame` and `debug.gpu_stats`
+mean what they mean in `halo.exe`. To play, use `halo.exe`.
 
 The two executables use the same `config.toml`, the same game data and the
 same saved games. These settings apply only to `halo_d3d11.exe`:
@@ -99,7 +103,10 @@ each HLSL text is its GLSL text with only the changes of the dialect. It
 gives the statistics of the keys and, with the folder of `halo.exe`, the
 shaders that the two folders have in common. The statistics line
 (`debug.gpu_stats`) gives the number of pixel shader keys and vertex shader
-variants that the draws used since the start.
+variants that the draws used since the start, the draws and the clears of
+each frame, the draws that were skipped and why, the textures and their
+size, the texture writes, the binds that the draw skipped because the state
+did not change, and the GL functions that the shared files called (zero).
 
 `halo_d3d11.exe` compiles each shader the first time that a draw uses it,
 and keeps the compiled shader in a cache on the disk:
@@ -158,24 +165,35 @@ These files use only the Windows SDK:
 | `d3d11/win32_d3d11_present.c` | The swap chain of `halo_d3d11.exe` and the presentation of each frame. |
 | `d3d11/win32_d3d11_memory.c` | The buffers of `halo_d3d11.exe` for the game's memory: the stream and index rings, the segments of the mirror and their upload ring, and the self-test of the copies. |
 | `d3d11/win32_d3d11_shaders.c` | The shader compiler of `halo_d3d11.exe`, its shader cache on the disk, the input layouts and the state objects, and their self-test. |
+| `d3d11/win32_d3d11_draw.c` | The draw of `halo_d3d11.exe`: the record of each draw bound (only what differs from the last draw) and drawn, the constant buffers, the attribute slot, the copy of a target that a draw samples while it draws into it. |
+| `d3d11/win32_d3d11_textures.c` | The textures of `halo_d3d11.exe`: made and written through `UpdateSubresource`, their views, their mip levels made by the device, the read-back for `debug.texture_dump_directory`. |
 
 `port.json` gives the Linux files that these files replace, and the Windows
 libraries of the link.
 
 `halo_d3d11.exe` has the objects of `halo.exe`, except `d3d8_gl.c`,
-`xgpu_post.c` and `gl_functions.c`. In their place it has the units of
-`d3d11/` (except the probe):
+`xbox_textures.c`, `xgpu_post.c` and `gl_functions.c`. In their place it
+has the units of `d3d11/` (except the probe):
 
 - `d3d11/d3d8_d3d11.c` is the Direct3D 8 device of the game. It is a copy
   of `port/linux/src/d3d8_gl.c` without OpenGL, and uses the Xbox SDK
   declarations.
+- `d3d11/xbox_textures_d3d11.c` is a copy of `port/linux/src/xbox_textures.c`,
+  the texture cache, that makes and writes its textures through the
+  backend. It makes the text atlas, the menus' art and the high-res HUD
+  bitmaps itself, from the read-only accessors of `hud_hires.c`,
+  `text_hires.c` and `menu_files.c` (`hud_hires_png_pixels`,
+  `text_hires_atlas_rows`, `menu_art_name`, `menu_art_serial`,
+  `menu_art_png`), which those files have for the Switch's and Android's
+  renderers; `halo.exe` has these functions too and does not call them.
 - `d3d11/nv2a_vsh_hlsl.c` and `d3d11/nv2a_psh_hlsl.c` are copies of the
   shader generators `port/linux/src/nv2a_vsh.c` and `nv2a_psh.c` that write
   HLSL instead of GLSL. `d3d11/hlsl_shaders.h` gives the constant buffers,
   the interface between the two stages and the version of the generators.
 - `d3d11/win32_d3d11.c`, `d3d11/win32_d3d11_present.c`,
-  `d3d11/win32_d3d11_memory.c` and `d3d11/win32_d3d11_shaders.c` use only
-  the Windows SDK. `d3d11/win32_d3d11.h` is shared by these four files.
+  `d3d11/win32_d3d11_memory.c`, `d3d11/win32_d3d11_shaders.c`,
+  `d3d11/win32_d3d11_draw.c` and `d3d11/win32_d3d11_textures.c` use only
+  the Windows SDK. `d3d11/win32_d3d11.h` is shared by these six files.
 - `d3d11/d3d11_backend.h` is the boundary between the two. It uses neither
   SDK.
 - `build/windows/gl_stubs.c` (generated by `tools/windows_gl_stubs.py`)

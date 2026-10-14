@@ -13,7 +13,7 @@ is applied in the decode, where GL set a swizzle on the texture (a BC texture
 whose order is not the Xbox's is decoded for it); the Android branches do
 not come (the copy is the desktop's); and the three high-res replacements
 (the text atlas, a menu's art, a high-res HUD bitmap) are made here from the
-accessors the shared files have (step 3), where the original took GL names
+accessors the shared files have, where the original took GL names
 from them. The exports every build shares (xgpu_texture_describe and the
 rest) keep their names: d3d8_resources.c and the Custom Edition loading link
 this copy's. xgpu_texture_get and xgpu_texture_cache_begin_frame, which only
@@ -834,6 +834,10 @@ struct texture_entry
 	memory watch serial read before it was found: the same while no watched
 	page has been written since (0: never found) */
 	unsigned long watched_serial, watched_generation;
+	/* its menu art's texture and levels (0: none), as of menu_art_serial */
+	unsigned long menu_serial;
+	uint32_t menu_texture;
+	unsigned long menu_levels;
 };
 
 #define TEXTURE_BUCKET_COUNT 4096
@@ -881,17 +885,235 @@ static unsigned long palette_hash(const D3DCOLOR *palette)
 	return hash ? hash : 1;
 }
 
+/* ---------- the high-res replacements
+
+The original took GL textures from the shared files (text_hires_atlas_texture,
+menu_art_texture, hud_hires_override_texture), whose GL calls would reach the
+counted stubs here: the three are made in this copy, through the backend,
+from the read-only accessors those files have for the deko3d and Vulkan
+renderers (text_hires_atlas_rows, menu_art_name, menu_art_serial,
+menu_art_png, hud_hires_png_pixels). The PNGs are RGBA with red first, which
+R8G8B8A8_UNORM reads: no swap. */
+
+/* a texture of a PNG (8-bit RGBA) with all its mip levels, made by the device
+(GenerateMips), as hud_hires_png_texture makes in GL: its handle, or 0 */
+static uint32_t png_texture(const void *png, unsigned long size, unsigned long *levels)
+{
+	unsigned long width = 0, height = 0, largest;
+	unsigned char *pixels = hud_hires_png_pixels(png, size, &width, &height);
+	struct d3d11_backend_texture description;
+	uint32_t texture;
+
+	if (!pixels)
+		return 0;
+	*levels = 1;
+	for (largest = width > height ? width : height; largest > 1; largest >>= 1)
+		(*levels)++;
+	memset(&description, 0, sizeof(description));
+	description.kind = D3D11_BACKEND_TEXTURE_KIND_2D;
+	description.format = D3D11_BACKEND_TEXTURE_FORMAT_RGBA8;
+	description.width = (uint32_t)width;
+	description.height = (uint32_t)height;
+	description.depth = 1;
+	description.levels = (uint32_t)*levels;
+	description.generate_mips = *levels > 1;
+	texture = d3d11_backend_texture_create(&description);
+	if (texture)
+	{
+		d3d11_backend_texture_write(texture, 0, 0, pixels, (uint32_t)(width * 4), (uint32_t)(width * height * 4), NULL);
+		d3d11_backend_texture_generate_mips(texture);
+	}
+	free(pixels);
+	return texture;
+}
+
+/* the text's atlas (text_hires.h): its texture, made and its changed rows
+written when data is its placeholder bitmap's; 0 if not */
+static uint32_t atlas_texture(unsigned long data)
+{
+	static uint32_t texture;
+	static BOOL failed;
+	long size, top, bottom;
+	const unsigned char *coverage;
+
+	if (failed)
+		return 0;
+	coverage = text_hires_atlas_rows(data, &size, texture == 0, &top, &bottom);
+	if (!coverage)
+		return 0;
+	if (!texture)
+	{
+		struct d3d11_backend_texture description;
+
+		memset(&description, 0, sizeof(description));
+		description.kind = D3D11_BACKEND_TEXTURE_KIND_2D;
+		description.format = D3D11_BACKEND_TEXTURE_FORMAT_RGBA8;
+		description.width = description.height = (uint32_t)size;
+		description.depth = 1;
+		description.levels = 1;
+		texture = d3d11_backend_texture_create(&description);
+		if (!texture)
+		{
+			failed = TRUE;
+			return 0;
+		}
+	}
+	if (top < bottom)
+	{
+		/* (white, the glyph's coverage its alpha, as the maps' fonts are) */
+		long rows = bottom - top;
+		unsigned char *texels = malloc((size_t)rows * size * 4);
+
+		if (texels)
+		{
+			long index;
+			uint32_t box[4];
+
+			for (index = 0; index < rows * size; index++)
+			{
+				texels[index * 4 + 0] = texels[index * 4 + 1] = texels[index * 4 + 2] = 255;
+				texels[index * 4 + 3] = coverage[(size_t)top * size + index];
+			}
+			box[0] = 0;
+			box[1] = (uint32_t)top;
+			box[2] = (uint32_t)size;
+			box[3] = (uint32_t)bottom;
+			d3d11_backend_texture_write(texture, 0, 0, texels, (uint32_t)(size * 4), (uint32_t)(rows * size * 4), box);
+			free(texels);
+		}
+	}
+	return texture;
+}
+
+/* a menu's art (menu_files.h), by its file: made on first use, and kept */
+#define MAXIMUM_MENU_TEXTURES 256
+
+static struct
+{
+	char *name;
+	uint32_t texture;
+	unsigned long levels;
+} menu_textures[MAXIMUM_MENU_TEXTURES];
+static long menu_texture_count;
+
+static uint32_t menu_texture(unsigned long data, unsigned long *levels)
+{
+	const char *name = menu_art_name(data);
+	const unsigned char *png;
+	unsigned long size = 0;
+	long index;
+
+	if (!name)
+		return 0;
+	for (index = 0; index < menu_texture_count; index++)
+	{
+		if (!strcmp(menu_textures[index].name, name))
+		{
+			*levels = menu_textures[index].levels;
+			return menu_textures[index].texture;
+		}
+	}
+	if (menu_texture_count == MAXIMUM_MENU_TEXTURES)
+		return 0;
+	/* (failed ones are remembered too, as texture 0) */
+	menu_textures[menu_texture_count].name = strdup(name);
+	if (!menu_textures[menu_texture_count].name)
+		return 0;
+	png = menu_art_png(name, &size);
+	menu_textures[menu_texture_count].texture = png ? png_texture(png, size, &menu_textures[menu_texture_count].levels) : 0;
+	if (!menu_textures[menu_texture_count].texture)
+		platform_log("menus: could not draw %s", name);
+	*levels = menu_textures[menu_texture_count].levels;
+	return menu_textures[menu_texture_count++].texture;
+}
+
+/* a high-res HUD bitmap (hud_hires.h): made on first use, and kept */
+static struct
+{
+	uint32_t texture;
+	unsigned long levels;
+	BOOL tried;
+} *hud_textures;
+
+static uint32_t hud_texture(long asset, unsigned long *levels)
+{
+	if (asset < 0 || asset >= (long)hud_hires_embedded_count)
+		return 0;
+	if (!hud_textures)
+	{
+		hud_textures = calloc(hud_hires_embedded_count, sizeof(*hud_textures));
+		if (!hud_textures)
+			return 0;
+	}
+	if (!hud_textures[asset].tried)
+	{
+		const struct hud_hires_embedded *embedded = &hud_hires_embedded[asset];
+
+		hud_textures[asset].tried = TRUE;
+		hud_textures[asset].texture = png_texture(embedded->png, embedded->png_size, &hud_textures[asset].levels);
+		if (!hud_textures[asset].texture)
+			platform_log("high-res hud: could not decode the texture for %s bitmap %d", embedded->tag,
+				embedded->bitmap);
+	}
+	*levels = hud_textures[asset].levels;
+	return hud_textures[asset].texture;
+}
+
 /* an entry's texture, kind and description: its high-res replacement's, if
-it has one, with the bitmap's own size (which its coordinates are in). The
-three replacements the original took from the shared files' GL textures
-(text_hires_atlas_texture, menu_art_texture, hud_hires_override_texture),
-which would reach the GL stubs here, are made in this copy from the
-accessors (step 3). */
+it has one, with the bitmap's own size (which its coordinates are in), as
+texture_entry_result in xbox_textures.c */
 static void texture_entry_result(struct texture_entry *entry, struct xgpu_d3d11_texture *result)
 {
 	result->handle = entry->texture;
 	result->kind = entry->kind;
 	result->description = entry->description;
+	/* (the high-res text's atlas, for its placeholder bitmap: text_hires.h) */
+	{
+		uint32_t atlas = atlas_texture(entry->data);
+
+		if (atlas)
+		{
+			result->description.levels = 1;
+			result->handle = atlas;
+			result->kind = D3D11_BACKEND_TEXTURE_KIND_2D;
+			return;
+		}
+	}
+	/* (a menu's bitmap: menu_files.h; looked up again only when the art
+	registered has changed: the search was 1.3% of the game thread, for every
+	texture of every draw, as under Vulkan: xbox_textures_vk.c) */
+	{
+		if (entry->menu_serial != menu_art_serial())
+		{
+			entry->menu_serial = menu_art_serial();
+			entry->menu_levels = 0;
+			entry->menu_texture = menu_texture(entry->data, &entry->menu_levels);
+		}
+		if (entry->menu_texture)
+		{
+			result->description.levels = entry->menu_levels;
+			result->description.hires = TRUE;
+			result->handle = entry->menu_texture;
+			result->kind = D3D11_BACKEND_TEXTURE_KIND_2D;
+			return;
+		}
+	}
+	if (entry->override >= 0)
+	{
+		unsigned long levels;
+		uint32_t texture = hud_texture(entry->override, &levels);
+
+		if (texture)
+		{
+			result->description.levels = levels;
+			result->description.hires = TRUE;
+			result->description.hires_coverage = hud_hires_override_coverage(entry->override);
+			result->description.hires_point_threshold = hud_hires_override_point_threshold(entry->override);
+			result->handle = texture;
+			result->kind = D3D11_BACKEND_TEXTURE_KIND_2D;
+			return;
+		}
+	}
 }
 
 void xgpu_d3d11_texture_get(const DWORD *resource, const D3DCOLOR *palette, struct xgpu_d3d11_texture *result)
@@ -1009,8 +1231,8 @@ void xgpu_d3d11_texture_get(const DWORD *resource, const D3DCOLOR *palette, stru
 			entry->override = hud_hires_override_find(entry->address, entry->description.width,
 				entry->description.height, entry->description.levels > 1 ?
 				xgpu_texture_level_offset(&entry->description, 1) : xgpu_texture_face_size(&entry->description));
-			/* (an override whose texture cannot be made is dropped: step 3) */
-			(void)levels;
+			if (entry->override >= 0 && !hud_texture(entry->override, &levels))
+				entry->override = -1;
 		}
 		if (entry->override < 0 && entry->size && platform_is_contiguous((void *)entry->address) &&
 			platform_is_contiguous((void *)(entry->address + entry->size - 1)))
