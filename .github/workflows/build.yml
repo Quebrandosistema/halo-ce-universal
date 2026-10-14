@@ -2,9 +2,11 @@ name: Build
 
 # Debug and release builds of the native ports (Linux, Windows, Android) for
 # every pushed commit, uploaded as artifacts. tools/ci_build.py does each
-# build; see it for the options. This fork builds Android and the Switch
-# only: the Linux and Windows jobs are kept, upstream's, but do not run
-# (if: false), and the release and the notice go without them.
+# build; see it for the options. This fork builds Android, the Switch and,
+# on Windows, the Direct3D 11 executable alone (halo_d3d11.exe,
+# port/windows/D3D11.md; not the OpenGL halo.exe): the Linux job is kept,
+# upstream's, but does not run (if: false), and the release and the notice
+# go without it and without the Windows build.
 #
 # Kept cheap:
 # - one job per platform builds both configurations, so its set-up (tools,
@@ -208,9 +210,8 @@ jobs:
 
   windows:
     # The runner image has LLVM, Python and Visual Studio's x86 libraries and
-    # Windows SDK.
-    # (not built by this fork: see the top)
-    if: false
+    # Windows SDK. (This fork builds the Direct3D 11 executable alone here:
+    # tools/ci_build.py; see the top.)
     runs-on: windows-2025
     timeout-minutes: 40
     defaults:

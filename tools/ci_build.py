@@ -38,9 +38,10 @@ OUTPUTS = {
     # (and the SDL3 the portable build brings, tools/linux_build.py, with its
     # zlib license, as the release carries the other libraries')
     "linux": ["build/linux/halo", "build/linux/libSDL3.so.0", "build/linux/SDL3-LICENSE.txt"],
-    # (halo_d3d11.exe: the Direct3D 11 executable, in development,
-    # port/windows/D3D11.md)
-    "windows": ["build/windows/halo.exe", "build/windows/halo_d3d11.exe", "build/windows/SDL3.dll"],
+    # the Direct3D 11 executable only (port/windows/D3D11.md): this fork's
+    # Windows build does not make or ship the OpenGL halo.exe (`ninja
+    # windows` makes both; the pipeline asks for the one)
+    "windows": ["build/windows/halo_d3d11.exe", "build/windows/SDL3.dll"],
     "android": [],  # the APK, below
     # the Switch is a host and a guest, and both are wanted: the NRO is the
     # program the console runs, and the ELF is the ILP32 game image it loads
@@ -103,6 +104,11 @@ def main() -> int:
         variant = "release" if args.config == "release" else "debug"
         run([gradlew, "--console=plain", "-q", f"assemble{variant.capitalize()}"], cwd=ROOT / "port/android")
         outputs = [APKS[variant]]
+    elif args.platform == "windows":
+        # the Direct3D 11 executable and the SDL beside it, not the OpenGL
+        # halo.exe (OUTPUTS)
+        run(["ninja", "build/windows/halo_d3d11.exe", "build/windows/SDL3.dll"])
+        outputs = OUTPUTS[args.platform]
     else:
         run(["ninja", args.platform])
         outputs = OUTPUTS[args.platform]
@@ -115,16 +121,16 @@ def main() -> int:
         shutil.copy2(ROOT / output, dist)
         print(f"{output} -> {dist.relative_to(ROOT)}", flush=True)
     if args.platform == "windows":
-        # the symbols of halo.exe, halo_d3d11.exe and SDL3.dll, apart (players do not need
-        # them): the workflow uploads them to Sentry, which turns the crash
-        # reports' minidumps into function names and lines
+        # the symbols of halo_d3d11.exe and SDL3.dll, apart (players do not
+        # need them): the workflow uploads them to Sentry, which turns the
+        # crash reports' minidumps into function names and lines
         # (port/windows/src/win32_crash.c), and tools/symbolize_crash.py
         # reads debug.txt's crash lines with them
         symbols = ROOT / "dist" / f"halo-windows-{args.config}-symbols"
         if symbols.exists():
             shutil.rmtree(symbols)
         symbols.mkdir(parents=True)
-        for pdb in [ROOT / "build/windows/halo.pdb", ROOT / "build/windows/halo_d3d11.pdb", *sorted((ROOT / "build/windows/third_party").glob("SDL3-*/lib/x86/SDL3.pdb"))]:
+        for pdb in [ROOT / "build/windows/halo_d3d11.pdb", *sorted((ROOT / "build/windows/third_party").glob("SDL3-*/lib/x86/SDL3.pdb"))]:
             shutil.copy2(pdb, symbols)
             print(f"{pdb.relative_to(ROOT)} -> {symbols.relative_to(ROOT)}", flush=True)
     # the disc image readers (port/linux/src/xiso.c, and the Android app's
