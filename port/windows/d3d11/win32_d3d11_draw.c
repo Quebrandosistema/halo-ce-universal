@@ -131,9 +131,17 @@ static int draw_objects_make(void)
 
 void d3d11_backend_state_forget(void)
 {
+	ID3D11ShaderResourceView *none[D3D11_BACKEND_STAGE_COUNT] = { NULL };
+
 	D.valid = 0;
 	D.viewport_valid = 0;
 	D.constants_bound = 0;
+	/* the stages to none, as the shadow will say: a target whose view a
+	stage still held would otherwise be bound over it at the next
+	targets_bind, which unbinds by the shadow (the runtime would unbind it,
+	and the layer warn) */
+	if (B.context)
+		ID3D11DeviceContext_PSSetShaderResources(B.context, 0, D3D11_BACKEND_STAGE_COUNT, none);
 	memset(D.views, 0, sizeof(D.views));
 	memset(D.slots, 0, sizeof(D.slots));
 	D.index_buffer = NULL;

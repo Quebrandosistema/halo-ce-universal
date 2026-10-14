@@ -85,7 +85,9 @@ device having resolved it first; the colour target's multisampled pixels
 resolved into its texture (a depth target is not: Direct3D 11 resolves no
 depth format, and nothing samples one) */
 int d3d11_backend_multisample_levels(uint32_t samples);
-void d3d11_backend_target_multisample(uint32_t handle, uint32_t samples);
+/* answers the samples in effect: the count asked for, or 0 when the device
+refused it (logged once; the target is drawn without) */
+uint32_t d3d11_backend_target_multisample(uint32_t handle, uint32_t samples);
 void d3d11_backend_target_resolve(uint32_t handle);
 
 /* the targets later clears (and, from phase 6, draws) go to; either 0 */

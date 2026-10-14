@@ -894,8 +894,11 @@ static void render_target_multisample(struct render_target_entry *entry, int sam
 	if (entry->target.samples == samples)
 		return;
 	render_target_resolve(entry);
+	/* (the samples in effect: 0 when the backend could not make the
+	storage, so the key, the rasterizer and the tests' area follow what
+	is drawn) */
 	if (entry->backend_target)
-		d3d11_backend_target_multisample(entry->backend_target, (uint32_t)samples);
+		samples = (int)d3d11_backend_target_multisample(entry->backend_target, (uint32_t)samples);
 	entry->target.samples = samples;
 }
 
@@ -936,6 +939,22 @@ static BOOL bind_targets(BOOL *has_depth)
 		render_target_multisample(color, samples);
 	if (depth)
 		render_target_multisample(depth, samples);
+	/* the backend binds a colour and a depth target at one sample count
+	only: a pair it could not multisample alike is drawn without its depth
+	target (logged once) */
+	if (color && depth && color->target.samples != depth->target.samples)
+	{
+		static BOOL logged;
+
+		if (!logged)
+		{
+			logged = TRUE;
+			platform_log("Direct3D 11: a colour target of %d samples and a depth target of %d are drawn without the "
+				"depth target (logged once)", color->target.samples, depth->target.samples);
+		}
+		depth = NULL;
+	}
+	samples = color ? color->target.samples : depth->target.samples;
 	if (samples)
 	{
 		if (color)
@@ -2377,8 +2396,10 @@ reads, from the mirror where it can be, else streamed, placed in the record
 the slots, draw_layout); the attributes' values are draw_prepare's. A stream
 whose stride is not aligned for its formats is streamed with each vertex's
 bytes copied at an aligned stride (stream_aligned_stride), the bytes GL read
-for it: past the stream's last vertex, zeros. */
-static void stream_data(unsigned long first, unsigned long count)
+for it: past the stream's last vertex, zeros. FALSE when such a copy could
+not be made: the draw is skipped (its vertices would be read at the wrong
+stride otherwise). */
+static BOOL stream_data(unsigned long first, unsigned long count)
 {
 	struct vertex_shader_object *declaration = device.vertex_shader;
 	uint32_t stream_buffers[16];
@@ -2476,7 +2497,7 @@ static void stream_data(unsigned long first, unsigned long count)
 			}
 			else
 			{
-				stream_offsets[stream] = stream_upload(base, aligned * count < available ? aligned * count : available);
+				return FALSE;
 			}
 			stream_buffers[stream] = STREAMED_IN_RING;
 			stats.streamed_bytes += aligned * count;
@@ -2502,6 +2523,7 @@ static void stream_data(unsigned long first, unsigned long count)
 		device.draw.streams[stream].offset = (uint32_t)stream_offsets[stream];
 		device.draw.streams[stream].stride = (uint32_t)stride;
 	}
+	return TRUE;
 }
 
 /* the record's indices: none (a plain draw of count vertices), or count of
@@ -2533,6 +2555,8 @@ static WORD *quad_indices(const WORD *indices, unsigned long count, unsigned lon
 	WORD *result = malloc(quads * 6 * sizeof(WORD) + 2);
 	unsigned long quad;
 
+	if (!result)
+		return NULL;
 	for (quad = 0; quad < quads; quad++)
 	{
 		WORD v0 = indices ? indices[quad * 4] : (WORD)(quad * 4);
@@ -2559,6 +2583,8 @@ static WORD *fan_indices(const WORD *indices, unsigned long count, unsigned long
 	WORD *result = malloc(triangles * 3 * sizeof(WORD) + 2);
 	unsigned long triangle;
 
+	if (!result)
+		return NULL;
 	for (triangle = 0; triangle < triangles; triangle++)
 	{
 		result[triangle * 3 + 0] = indices ? indices[0] : (WORD)0;
@@ -2576,12 +2602,17 @@ static WORD *loop_indices(const WORD *indices, unsigned long count, unsigned lon
 	WORD *result = malloc((count + 1) * sizeof(WORD) + 2);
 	unsigned long index;
 
+	if (!result)
+		return NULL;
 	for (index = 0; index < count; index++)
 		result[index] = indices ? indices[index] : (WORD)index;
 	result[count] = count ? result[0] : 0;
 	*out_count = count ? count + 1 : 0;
 	return result;
 }
+
+/* (each of the three answers NULL when there is no memory for the indices:
+the draw is skipped, counted with the buffers') */
 
 /* whether the primitive type is drawn from indices made for the draw
 (quad_indices, fan_indices, loop_indices) */
@@ -4643,8 +4674,10 @@ static void shader_service_self_test(char *line, size_t line_size)
 			element->stream = (unsigned char)(index % 2);
 			element->type = types[index];
 			element->bytes = (unsigned char)vertex_type_bytes(element->type);
-			/* (each at a multiple of 16: the alignment is not what is tried) */
+			/* (each at a multiple of 16: the alignment is not what is tried;
+			the layout reads packed_offset, which declaration_pack would set) */
 			element->offset = (unsigned short)(element->reg / 2 * 16);
+			element->packed_offset = element->offset;
 			element_masks(element, &declaration.packed_mask, &declaration.integer_mask,
 				&declaration.three_component_mask);
 		}
@@ -4748,13 +4781,22 @@ void WINAPI D3DDevice_DrawVertices(D3DPRIMITIVETYPE primitive_type, UINT start_v
 	if (!vertex_count || !draw_ready() || !draw_prepare(FALSE))
 		return;
 	trace_draw("draw", primitive_type, vertex_count, NULL);
-	stream_data(start_vertex, vertex_count);
+	if (!stream_data(start_vertex, vertex_count))
+	{
+		stats.skipped_no_buffer++;
+		return;
+	}
 	device.draw.topology = primitive_topology(primitive_type);
 	if (primitive_made(primitive_type))
 	{
 		unsigned long count;
 		WORD *indices = made_indices(primitive_type, NULL, vertex_count, &count);
 
+		if (!indices)
+		{
+			stats.skipped_no_buffer++;
+			return;
+		}
 		draw_indices_at(D3D11_BACKEND_DATA_RING, 0, index_upload(indices, count * sizeof(WORD)), count, 0);
 		free(indices);
 	}
@@ -4782,7 +4824,11 @@ void WINAPI D3DDevice_DrawIndexedVertices(D3DPRIMITIVETYPE primitive_type, UINT 
 	index_extent(index_data, vertex_count, generation, mirrored, &minimum, &maximum);
 	trace_draw("indexed", primitive_type, vertex_count, NULL);
 	/* (the streams from the base vertex on: index i is vertex base + i) */
-	stream_data(device.base_vertex_index + minimum, maximum - minimum + 1);
+	if (!stream_data(device.base_vertex_index + minimum, maximum - minimum + 1))
+	{
+		stats.skipped_no_buffer++;
+		return;
+	}
 	device.draw.topology = primitive_topology(primitive_type);
 	if (mirrored)
 	{
@@ -4796,6 +4842,11 @@ void WINAPI D3DDevice_DrawIndexedVertices(D3DPRIMITIVETYPE primitive_type, UINT 
 	if (primitive_made(primitive_type))
 	{
 		indices = made_indices(primitive_type, index_data, vertex_count, &count);
+		if (!indices)
+		{
+			stats.skipped_no_buffer++;
+			return;
+		}
 		source = indices;
 	}
 	draw_indices_at(D3D11_BACKEND_DATA_RING, 0, index_upload(source, count * sizeof(WORD)), count, -(long)minimum);
@@ -4849,6 +4900,11 @@ void WINAPI D3DDevice_End(void)
 		unsigned long index_count;
 		WORD *indices = made_indices(type, NULL, count, &index_count);
 
+		if (!indices)
+		{
+			stats.skipped_no_buffer++;
+			return;
+		}
 		draw_indices_at(D3D11_BACKEND_DATA_RING, 0, index_upload(indices, index_count * sizeof(WORD)), index_count, 0);
 		free(indices);
 	}

@@ -927,18 +927,21 @@ int d3d11_backend_multisample_levels(uint32_t samples)
 	return color > 0 && depth > 0;
 }
 
-void d3d11_backend_target_multisample(uint32_t handle, uint32_t samples)
+uint32_t d3d11_backend_target_multisample(uint32_t handle, uint32_t samples)
 {
 	struct target *target = target_from_handle(handle);
 	D3D11_TEXTURE2D_DESC description;
 	HRESULT result;
 
 	if (!B.device || B.lost || !target)
-		return;
+		return 0;
 	if (samples < 2)
 		samples = 0;
 	if (target->samples == samples)
-		return;
+		return samples;
+	/* (a count the device refused is not asked for again at every bind) */
+	if (samples && samples == target->samples_refused)
+		return 0;
 	/* (what is bound is bound again: the views change) */
 	if (bound_color == target || bound_depth == target)
 	{
@@ -950,7 +953,7 @@ void d3d11_backend_target_multisample(uint32_t handle, uint32_t samples)
 	release(&target->multisampled);
 	target->samples = 0;
 	if (!samples)
-		return;
+		return 0;
 	memset(&description, 0, sizeof(description));
 	description.Width = target->width;
 	description.Height = target->height;
@@ -984,14 +987,16 @@ void d3d11_backend_target_multisample(uint32_t handle, uint32_t samples)
 		release(&target->multisampled_color);
 		release(&target->multisampled_depth);
 		release(&target->multisampled);
-		return;
+		target->samples_refused = samples;
+		return 0;
 	}
 	target->samples = samples;
+	target->samples_refused = 0;
 	if (target->is_depth)
 	{
 		ID3D11DeviceContext_ClearDepthStencilView(B.context, target->multisampled_depth,
 			D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
-		return;
+		return samples;
 	}
 	/* the target's pixels into every sample */
 	if (d3d11_backend_shaders())
@@ -1027,6 +1032,7 @@ void d3d11_backend_target_multisample(uint32_t handle, uint32_t samples)
 		ID3D11DeviceContext_PSSetShaderResources(B.context, 0, 1, &none);
 		d3d11_backend_state_forget();
 	}
+	return samples;
 }
 
 void d3d11_backend_target_resolve(uint32_t handle)
@@ -1051,6 +1057,8 @@ int d3d11_backend_draw_clear(uint32_t channels, const float color[4], float z, u
 	const D3D11_RECT *rectangle)
 {
 	D3D11_MAPPED_SUBRESOURCE mapped;
+	D3D11_VIEWPORT viewport;
+	struct target *whole;
 	float *values;
 	int depth = (channels & D3D11_BACKEND_CLEAR_DEPTH) != 0;
 	int stencil_asked = (channels & D3D11_BACKEND_CLEAR_STENCIL) != 0;
@@ -1076,6 +1084,20 @@ int d3d11_backend_draw_clear(uint32_t channels, const float color[4], float z, u
 	ID3D11DeviceContext_OMSetDepthStencilState(B.context, S.depth_stencil[depth | stencil_asked << 1], stencil & 0xff);
 	ID3D11DeviceContext_RSSetState(B.context, d3d11_backend_scissored);
 	ID3D11DeviceContext_RSSetScissorRects(B.context, 1, rectangle);
+	/* the whole of the bound target at [0, 1]: the draws leave the viewport
+	and depth range of the last of them, which would clip the clear to it
+	(the present's marker, with no target bound, sets its own) */
+	whole = bound_valid ? (bound_color ? bound_color : bound_depth) : NULL;
+	if (whole)
+	{
+		viewport.TopLeftX = 0.0f;
+		viewport.TopLeftY = 0.0f;
+		viewport.Width = (float)whole->width;
+		viewport.Height = (float)whole->height;
+		viewport.MinDepth = 0.0f;
+		viewport.MaxDepth = 1.0f;
+		ID3D11DeviceContext_RSSetViewports(B.context, 1, &viewport);
+	}
 	ID3D11DeviceContext_Draw(B.context, 3, 0);
 	/* (the draws' shadow no longer holds) */
 	d3d11_backend_state_forget();

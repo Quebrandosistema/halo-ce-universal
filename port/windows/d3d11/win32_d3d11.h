@@ -136,6 +136,8 @@ struct target
 	ID3D11RenderTargetView *multisampled_color;
 	ID3D11DepthStencilView *multisampled_depth;
 	uint32_t samples;
+	/* a count the device refused (logged once): not asked for again */
+	uint32_t samples_refused;
 };
 
 /* a colour (B8G8R8A8_UNORM) or depth target made and cleared once; 0 if it

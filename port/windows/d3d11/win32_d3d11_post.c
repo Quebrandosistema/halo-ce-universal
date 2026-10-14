@@ -340,6 +340,11 @@ static int texture_make(DXGI_FORMAT format, uint32_t width, uint32_t height, int
 			platform_log("anti-aliasing: a texture of %ux%u was not made (%s; logged once)", width, height,
 				hr_text(result));
 		}
+		/* (nothing half made is kept) */
+		if (render)
+			release(render);
+		release(view);
+		release(texture);
 		return 0;
 	}
 	return 1;
@@ -374,6 +379,8 @@ int d3d11_backend_anti_alias_prepare(int smaa, const void *area, const void *sea
 			!texture_make(DXGI_FORMAT_R8_UNORM, 64, 16, 0, search, 64, &P.search, &P.search_view, NULL))
 		{
 			platform_log("anti-aliasing: SMAA's lookup textures were not made");
+			release(&P.search_view);
+			release(&P.search);
 			release(&P.area_view);
 			release(&P.area);
 			P.failed[1] = 1;
@@ -497,6 +504,24 @@ static void intermediate_clear(ID3D11RenderTargetView *target)
 	ID3D11DeviceContext_ClearRenderTargetView(B.context, target, zero);
 }
 
+/* whether the passes of a kind can run: what d3d11_backend_anti_alias_prepare
+makes is there and nothing failed (read only: a pass never prepares itself,
+which for SMAA, with no lookup texels at hand, could only fail) */
+static int pass_ready(int smaa)
+{
+	int first = smaa ? PASS_SMAA_EDGES : PASS_FXAA, last = smaa ? PASS_SMAA_BLEND : PASS_FXAA;
+	int which;
+
+	if (P.failed[smaa] || !P.constants || (smaa && (!P.area || !P.search)))
+		return 0;
+	for (which = first; which <= last; which++)
+	{
+		if (!P.shaders[which])
+			return 0;
+	}
+	return 1;
+}
+
 int d3d11_backend_anti_alias(int smaa, uint32_t handle, const int32_t corners[4])
 {
 	struct target *target = d3d11_backend_target_at(handle);
@@ -508,12 +533,10 @@ int d3d11_backend_anti_alias(int smaa, uint32_t handle, const int32_t corners[4]
 	HRESULT result;
 
 	smaa = smaa != 0;
-	/* (prepared already, as the setting was chosen) */
-	if (!B.device || B.lost || !target || target->is_depth || target->samples ||
-		!d3d11_backend_anti_alias_prepare(smaa, NULL, NULL))
-	{
+	/* (prepared already, as the setting was chosen: d3d11_backend_anti_alias_prepare
+	made the shaders, the objects and SMAA's lookup textures, or failed once) */
+	if (!B.device || B.lost || !target || target->is_depth || target->samples || !pass_ready(smaa))
 		return 0;
-	}
 	rectangle.left = corners[0] > 0 ? corners[0] : 0;
 	rectangle.top = corners[1] > 0 ? corners[1] : 0;
 	rectangle.right = corners[2] < (int32_t)target->width ? corners[2] : (LONG)target->width;

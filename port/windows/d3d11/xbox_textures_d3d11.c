@@ -956,13 +956,15 @@ written when data is its placeholder bitmap's; 0 if not */
 static uint32_t atlas_texture(unsigned long data)
 {
 	static uint32_t texture;
-	static BOOL failed;
+	static BOOL failed, write_all;
 	long size, top, bottom;
 	const unsigned char *coverage;
 
 	if (failed)
 		return 0;
-	coverage = text_hires_atlas_rows(data, &size, texture == 0, &top, &bottom);
+	/* (the rows asked for count as sent: all of them again after a write
+	that was not made, so no glyph is lost) */
+	coverage = text_hires_atlas_rows(data, &size, texture == 0 || write_all, &top, &bottom);
 	if (!coverage)
 		return 0;
 	if (!texture)
@@ -981,6 +983,7 @@ static uint32_t atlas_texture(unsigned long data)
 			failed = TRUE;
 			return 0;
 		}
+		write_all = TRUE;
 	}
 	if (top < bottom)
 	{
@@ -988,6 +991,7 @@ static uint32_t atlas_texture(unsigned long data)
 		long rows = bottom - top;
 		unsigned char *texels = malloc((size_t)rows * size * 4);
 
+		write_all = TRUE;
 		if (texels)
 		{
 			long index;
@@ -1002,7 +1006,11 @@ static uint32_t atlas_texture(unsigned long data)
 			box[1] = (uint32_t)top;
 			box[2] = (uint32_t)size;
 			box[3] = (uint32_t)bottom;
-			d3d11_backend_texture_write(texture, 0, 0, texels, (uint32_t)(size * 4), (uint32_t)(rows * size * 4), box);
+			if (d3d11_backend_texture_write(texture, 0, 0, texels, (uint32_t)(size * 4), (uint32_t)(rows * size * 4),
+				box))
+			{
+				write_all = FALSE;
+			}
 			free(texels);
 		}
 	}
