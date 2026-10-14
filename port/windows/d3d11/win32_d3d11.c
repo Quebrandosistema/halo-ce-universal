@@ -34,7 +34,11 @@ memory unit's.
 Phase 6: the targets bound only when the pair changes, a stage sampling the
 colour target unbound first; the draws' shadow (win32_d3d11_draw.c) told
 when the clears draw; destroy releases the draw unit's and the textures
-unit's objects after the service's.
+unit's objects after the service's. Step 5: a target's multisampled texture
+(display.anti_aliasing's msaa values), which draws and clears go to while it
+exists, made with the target's pixels copied in (the copy's pixel shader:
+Direct3D 11 has no blit into a multisampled texture) and resolved into the
+target's texture when the device asks; the samples both formats allow.
 
 hr_text, drain_debug (as backend_drain_debug), choose_adapter and
 create_device are copied from phase 0's probe (win32_d3d11_probe.c), where they
@@ -439,6 +443,7 @@ void d3d11_backend_destroy(void)
 	d3d11_backend_shaders_release();
 	d3d11_backend_draw_release();
 	d3d11_backend_textures_release();
+	d3d11_backend_post_release();
 	resources_release();
 	ID3D11DeviceContext_Flush(B.context);
 	release(&B.context);
@@ -511,10 +516,12 @@ static const char builtin_hlsl[] =
 	"}\n"
 	"Texture2D picture : register(t0);\n"
 	"SamplerState linear_clamp : register(s0);\n"
-	"float4 present_ps(v2p i) : SV_Target { return float4(picture.Sample(linear_clamp, i.uv).rgb, 1.0); }\n";
+	"float4 present_ps(v2p i) : SV_Target { return float4(picture.Sample(linear_clamp, i.uv).rgb, 1.0); }\n"
+	"float4 copy_ps(v2p i) : SV_Target { return picture.Load(int3(i.position.xy, 0)); }\n";
 
 ID3D11VertexShader *d3d11_backend_triangle_vs;
 ID3D11PixelShader *d3d11_backend_present_ps;
+ID3D11PixelShader *d3d11_backend_copy_ps;
 ID3D11SamplerState *d3d11_backend_linear_sampler;
 ID3D11BlendState *d3d11_backend_write_all;
 ID3D11DepthStencilState *d3d11_backend_depth_off;
@@ -540,7 +547,7 @@ static int compile(const char *entry, const char *target, ID3DBlob **code)
 
 static int make_shaders(void)
 {
-	ID3DBlob *vs = NULL, *clear = NULL, *present = NULL;
+	ID3DBlob *vs = NULL, *clear = NULL, *present = NULL, *copy = NULL;
 	D3D11_BUFFER_DESC buffer;
 	D3D11_SAMPLER_DESC sampler;
 	D3D11_RASTERIZER_DESC rasterizer;
@@ -550,11 +557,12 @@ static int make_shaders(void)
 	int index;
 
 	if (!compile("triangle_vs", "vs_4_0", &vs) || !compile("clear_ps", "ps_4_0", &clear) ||
-		!compile("present_ps", "ps_4_0", &present))
+		!compile("present_ps", "ps_4_0", &present) || !compile("copy_ps", "ps_4_0", &copy))
 	{
 		release(&vs);
 		release(&clear);
 		release(&present);
+		release(&copy);
 		return 0;
 	}
 	result = ID3D11Device_CreateVertexShader(B.device, ID3D10Blob_GetBufferPointer(vs), ID3D10Blob_GetBufferSize(vs),
@@ -565,9 +573,13 @@ static int make_shaders(void)
 	if (SUCCEEDED(result))
 		result = ID3D11Device_CreatePixelShader(B.device, ID3D10Blob_GetBufferPointer(present),
 			ID3D10Blob_GetBufferSize(present), NULL, &d3d11_backend_present_ps);
+	if (SUCCEEDED(result))
+		result = ID3D11Device_CreatePixelShader(B.device, ID3D10Blob_GetBufferPointer(copy),
+			ID3D10Blob_GetBufferSize(copy), NULL, &d3d11_backend_copy_ps);
 	release(&vs);
 	release(&clear);
 	release(&present);
+	release(&copy);
 
 	/* the clear's colour and depth: 32 bytes, rewritten at each drawn clear */
 	memset(&buffer, 0, sizeof(buffer));
@@ -671,6 +683,10 @@ static uint32_t staging_width, staging_height;
 
 void d3d11_backend_target_free(struct target *target)
 {
+	release(&target->multisampled_color);
+	release(&target->multisampled_depth);
+	release(&target->multisampled);
+	target->samples = 0;
 	release(&target->view);
 	release(&target->depth);
 	release(&target->color);
@@ -815,6 +831,18 @@ static void targets_bind(struct target *color, struct target *depth)
 		}
 		depth = NULL;
 	}
+	if (color && depth && color->samples != depth->samples)
+	{
+		static int logged;
+
+		if (!logged)
+		{
+			logged = 1;
+			platform_log("d3d11: a depth target of %u samples named with a colour target of %u is left out (Direct3D "
+				"11 binds the two only at one sample count; logged once)", depth->samples, color->samples);
+		}
+		depth = NULL;
+	}
 	if (bound_valid && bound_color == color && bound_depth == depth)
 		return;
 	bound_color = color;
@@ -822,8 +850,8 @@ static void targets_bind(struct target *color, struct target *depth)
 	bound_valid = 1;
 	if (color)
 		d3d11_backend_draw_target_unbind(color->view);
-	views[0] = color ? color->color : NULL;
-	ID3D11DeviceContext_OMSetRenderTargets(B.context, 1, views, depth ? depth->depth : NULL);
+	views[0] = color ? d3d11_backend_target_color_view(color) : NULL;
+	ID3D11DeviceContext_OMSetRenderTargets(B.context, 1, views, depth ? d3d11_backend_target_depth_view(depth) : NULL);
 	d3d11_backend_draw_viewport_forget();
 	whole = color ? color : depth;
 	if (whole)
@@ -853,6 +881,168 @@ void d3d11_backend_targets_forget(void)
 	bound_color = NULL;
 	bound_depth = NULL;
 	bound_valid = 0;
+}
+
+void d3d11_backend_targets_rebind(void)
+{
+	bound_valid = 0;
+}
+
+ID3D11RenderTargetView *d3d11_backend_target_color_view(struct target *target)
+{
+	return target->samples ? target->multisampled_color : target->color;
+}
+
+ID3D11DepthStencilView *d3d11_backend_target_depth_view(struct target *target)
+{
+	return target->samples ? target->multisampled_depth : target->depth;
+}
+
+/* ---------- multisampling
+
+The device's (render_target_multisample, render_target_resolve in
+d3d8_gl.c): a target drawn with samples has a multisampled texture of its
+size and format beside its own, which the bindings and the clears use, made
+at the first ask and made again for other samples. The colour target's
+pixels are put into the new texture (a full-target draw of the copy's pixel
+shader); a depth target's new texture is cleared, as d3d8_gl.c's Android
+branch does, since nothing samples a depth buffer and the frame clears it.
+A resolve is ResolveSubresource of the colour target's (the formats are the
+same); a depth target is not resolved (Direct3D 11 resolves no depth
+format), which leaves its texture as it was. */
+
+static uint32_t resolves;
+
+int d3d11_backend_multisample_levels(uint32_t samples)
+{
+	UINT color = 0, depth = 0;
+
+	if (!B.device || B.lost || samples < 2)
+		return 0;
+	if (FAILED(ID3D11Device_CheckMultisampleQualityLevels(B.device, DXGI_FORMAT_B8G8R8A8_UNORM, samples, &color)) ||
+		FAILED(ID3D11Device_CheckMultisampleQualityLevels(B.device, DXGI_FORMAT_D24_UNORM_S8_UINT, samples, &depth)))
+	{
+		return 0;
+	}
+	return color > 0 && depth > 0;
+}
+
+void d3d11_backend_target_multisample(uint32_t handle, uint32_t samples)
+{
+	struct target *target = target_from_handle(handle);
+	D3D11_TEXTURE2D_DESC description;
+	HRESULT result;
+
+	if (!B.device || B.lost || !target)
+		return;
+	if (samples < 2)
+		samples = 0;
+	if (target->samples == samples)
+		return;
+	/* (what is bound is bound again: the views change) */
+	if (bound_color == target || bound_depth == target)
+	{
+		ID3D11DeviceContext_OMSetRenderTargets(B.context, 0, NULL, NULL);
+		bound_valid = 0;
+	}
+	release(&target->multisampled_color);
+	release(&target->multisampled_depth);
+	release(&target->multisampled);
+	target->samples = 0;
+	if (!samples)
+		return;
+	memset(&description, 0, sizeof(description));
+	description.Width = target->width;
+	description.Height = target->height;
+	description.MipLevels = 1;
+	description.ArraySize = 1;
+	description.Format = target->is_depth ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_B8G8R8A8_UNORM;
+	description.SampleDesc.Count = samples;
+	description.Usage = D3D11_USAGE_DEFAULT;
+	description.BindFlags = target->is_depth ? D3D11_BIND_DEPTH_STENCIL : D3D11_BIND_RENDER_TARGET;
+	result = ID3D11Device_CreateTexture2D(B.device, &description, NULL, &target->multisampled);
+	if (SUCCEEDED(result))
+	{
+		if (target->is_depth)
+			result = ID3D11Device_CreateDepthStencilView(B.device, (ID3D11Resource *)target->multisampled, NULL,
+				&target->multisampled_depth);
+		else
+			result = ID3D11Device_CreateRenderTargetView(B.device, (ID3D11Resource *)target->multisampled, NULL,
+				&target->multisampled_color);
+	}
+	if (backend_failed(result, "a multisampled target"))
+	{
+		static int logged;
+
+		if (!logged)
+		{
+			logged = 1;
+			platform_log("d3d11: a %s target of %ux%u with %u samples was not made (%s): drawn without (logged "
+				"once)", target->is_depth ? "depth" : "colour", target->width, target->height, samples,
+				hr_text(result));
+		}
+		release(&target->multisampled_color);
+		release(&target->multisampled_depth);
+		release(&target->multisampled);
+		return;
+	}
+	target->samples = samples;
+	if (target->is_depth)
+	{
+		ID3D11DeviceContext_ClearDepthStencilView(B.context, target->multisampled_depth,
+			D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+		return;
+	}
+	/* the target's pixels into every sample */
+	if (d3d11_backend_shaders())
+	{
+		ID3D11ShaderResourceView *none = NULL;
+		D3D11_VIEWPORT viewport;
+		D3D11_RECT rectangle;
+
+		d3d11_backend_draw_target_unbind(target->view);
+		ID3D11DeviceContext_OMSetRenderTargets(B.context, 1, &target->multisampled_color, NULL);
+		bound_valid = 0;
+		viewport.TopLeftX = 0.0f;
+		viewport.TopLeftY = 0.0f;
+		viewport.Width = (float)target->width;
+		viewport.Height = (float)target->height;
+		viewport.MinDepth = 0.0f;
+		viewport.MaxDepth = 1.0f;
+		rectangle.left = 0;
+		rectangle.top = 0;
+		rectangle.right = (LONG)target->width;
+		rectangle.bottom = (LONG)target->height;
+		ID3D11DeviceContext_RSSetViewports(B.context, 1, &viewport);
+		ID3D11DeviceContext_IASetInputLayout(B.context, NULL);
+		ID3D11DeviceContext_IASetPrimitiveTopology(B.context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		ID3D11DeviceContext_VSSetShader(B.context, d3d11_backend_triangle_vs, NULL, 0);
+		ID3D11DeviceContext_PSSetShader(B.context, d3d11_backend_copy_ps, NULL, 0);
+		ID3D11DeviceContext_PSSetShaderResources(B.context, 0, 1, &target->view);
+		ID3D11DeviceContext_OMSetBlendState(B.context, d3d11_backend_write_all, NULL, 0xffffffff);
+		ID3D11DeviceContext_OMSetDepthStencilState(B.context, d3d11_backend_depth_off, 0);
+		ID3D11DeviceContext_RSSetState(B.context, d3d11_backend_scissored);
+		ID3D11DeviceContext_RSSetScissorRects(B.context, 1, &rectangle);
+		ID3D11DeviceContext_Draw(B.context, 3, 0);
+		ID3D11DeviceContext_PSSetShaderResources(B.context, 0, 1, &none);
+		d3d11_backend_state_forget();
+	}
+}
+
+void d3d11_backend_target_resolve(uint32_t handle)
+{
+	struct target *target = target_from_handle(handle);
+
+	if (!B.device || B.lost || !target || !target->samples || target->is_depth)
+		return;
+	ID3D11DeviceContext_ResolveSubresource(B.context, (ID3D11Resource *)target->texture, 0,
+		(ID3D11Resource *)target->multisampled, 0, DXGI_FORMAT_B8G8R8A8_UNORM);
+	resolves++;
+}
+
+uint32_t d3d11_backend_target_resolves(void)
+{
+	return resolves;
 }
 
 /* ---------- clears */
@@ -916,12 +1106,12 @@ uint32_t d3d11_backend_clear(uint32_t channels, const float color[4], float z, u
 	{
 		if ((channels & D3D11_BACKEND_CLEAR_COLOR) == D3D11_BACKEND_CLEAR_COLOR)
 		{
-			ID3D11DeviceContext_ClearRenderTargetView(B.context, bound_color->color, color);
+			ID3D11DeviceContext_ClearRenderTargetView(B.context, d3d11_backend_target_color_view(bound_color), color);
 			color_call = 1;
 		}
 		if (channels & (D3D11_BACKEND_CLEAR_DEPTH | D3D11_BACKEND_CLEAR_STENCIL))
 		{
-			ID3D11DeviceContext_ClearDepthStencilView(B.context, bound_depth->depth,
+			ID3D11DeviceContext_ClearDepthStencilView(B.context, d3d11_backend_target_depth_view(bound_depth),
 				((channels & D3D11_BACKEND_CLEAR_DEPTH) ? D3D11_CLEAR_DEPTH : 0) |
 				((channels & D3D11_BACKEND_CLEAR_STENCIL) ? D3D11_CLEAR_STENCIL : 0), z, (UINT8)stencil);
 			depth_call = 1;
@@ -1140,6 +1330,7 @@ static void resources_release(void)
 	release(&d3d11_backend_linear_sampler);
 	release(&S.constants);
 	release(&d3d11_backend_present_ps);
+	release(&d3d11_backend_copy_ps);
 	release(&S.clear_ps);
 	release(&d3d11_backend_triangle_vs);
 	S.state = 0;

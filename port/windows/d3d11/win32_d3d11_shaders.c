@@ -149,6 +149,43 @@ int d3d11_backend_compile(const char *source, size_t size, const char *name, con
 	return SUCCEEDED(result);
 }
 
+/* ID3D11ShaderReflection's interface identifier (d3d11shader.h's, which
+dxguid.lib may not hold) */
+static const GUID reflection_interface =
+	{ 0x8d536ca1, 0x0cca, 0x4956, { 0xa8, 0x37, 0x78, 0x69, 0x63, 0x75, 0x55, 0x84 } };
+
+int d3d11_backend_sampler_register(ID3DBlob *code, const char *name, UINT *slot)
+{
+	typedef HRESULT(WINAPI * reflect_function)(LPCVOID, SIZE_T, REFIID, void **);
+	static reflect_function reflect;
+	ID3D11ShaderReflection *reflection = NULL;
+	D3D11_SHADER_INPUT_BIND_DESC binding;
+	HRESULT result;
+
+	if (!load_compiler())
+		return 0;
+	if (!reflect)
+		reflect = (reflect_function)(void *)GetProcAddress(compiler.library, "D3DReflect");
+	if (!reflect)
+	{
+		platform_log("d3d11: the shader compiler has no D3DReflect: %s's register is not known", name);
+		return 0;
+	}
+	result = reflect(ID3D10Blob_GetBufferPointer(code), ID3D10Blob_GetBufferSize(code), &reflection_interface,
+		(void **)&reflection);
+	if (FAILED(result))
+	{
+		platform_log("d3d11: D3DReflect failed (%s): %s's register is not known", hr_text(result), name);
+		return 0;
+	}
+	result = reflection->lpVtbl->GetResourceBindingDescByName(reflection, name, &binding);
+	reflection->lpVtbl->Release(reflection);
+	if (FAILED(result))
+		return 0;
+	*slot = binding.BindPoint;
+	return 1;
+}
+
 int d3d11_backend_shader_compiles(const char *source, size_t size, const char *name, const char *entry,
 	const char *target)
 {

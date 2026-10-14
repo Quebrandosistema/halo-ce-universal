@@ -95,9 +95,12 @@ struct target *d3d11_backend_target_at(uint32_t handle);
 /* the present's objects released (d3d11_backend_destroy, before the rest) */
 void d3d11_backend_present_release(void);
 
-/* the built-in shaders and the sampler the present's draw uses */
+/* the built-in shaders and the sampler the present's draw uses; the copy's
+pixel shader (a texel of the texture in slot 0 at each pixel, all four
+channels: a target's pixels into its multisampled texture) */
 extern ID3D11VertexShader *d3d11_backend_triangle_vs;
 extern ID3D11PixelShader *d3d11_backend_present_ps;
+extern ID3D11PixelShader *d3d11_backend_copy_ps;
 extern ID3D11SamplerState *d3d11_backend_linear_sampler;
 extern ID3D11BlendState *d3d11_backend_write_all;
 extern ID3D11DepthStencilState *d3d11_backend_depth_off;
@@ -125,6 +128,14 @@ struct target
 	ID3D11ShaderResourceView *view;
 	uint32_t width, height;
 	int is_depth;
+	/* with multisampling (d3d11_backend_target_multisample): a texture of
+	the same size and format with samples a pixel (0: none) and its view,
+	which draws and clears go to while it exists; the texture above has its
+	pixels after a resolve */
+	ID3D11Texture2D *multisampled;
+	ID3D11RenderTargetView *multisampled_color;
+	ID3D11DepthStencilView *multisampled_depth;
+	uint32_t samples;
 };
 
 /* a colour (B8G8R8A8_UNORM) or depth target made and cleared once; 0 if it
@@ -176,5 +187,25 @@ ID3D11ShaderResourceView *d3d11_backend_texture_view(uint32_t handle);
 ID3D11ShaderResourceView *d3d11_backend_composite_view(uint32_t handle);
 void d3d11_backend_textures_statistics(uint32_t counts[D3D11_BACKEND_DRAW_STATISTICS]);
 void d3d11_backend_textures_release(void);
+
+/* the targets' resolves since the start (win32_d3d11.c), for the draw
+statistics */
+uint32_t d3d11_backend_target_resolves(void);
+
+/* the view a target is drawn into: its multisampled texture's while it has
+one (NULL for none) */
+ID3D11RenderTargetView *d3d11_backend_target_color_view(struct target *target);
+ID3D11DepthStencilView *d3d11_backend_target_depth_view(struct target *target);
+
+/* the bound targets bound again by the next draw or clear (the passes bind
+their own) */
+void d3d11_backend_targets_rebind(void);
+
+/* a sampler's register in a compiled shader, by its name (D3DReflect, the
+compiler's other export); 0 if it has none (logged) */
+int d3d11_backend_sampler_register(ID3DBlob *code, const char *name, UINT *slot);
+
+/* the anti-aliasing passes' objects released (win32_d3d11_post.c) */
+void d3d11_backend_post_release(void);
 
 #endif

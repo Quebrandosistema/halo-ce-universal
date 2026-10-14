@@ -314,12 +314,142 @@ uint32_t d3d11_backend_textures_alive(uint32_t *bytes)
 	return T.alive;
 }
 
-/* ---------- the mip composites (step 5) */
+/* ---------- the mip composites (step 5)
+
+A texture the game draws a level at a time, each level a render target of
+its own (the water's ripples), sampled with all its levels: d3d8_gl.c's
+mip_composite_get. A B8G8R8A8_UNORM texture with every level, made with
+RENDER_TARGET and MISC_GENERATE_MIPS; the levels the game drew copied from
+their targets (CopySubresourceRegion, level to level, the sizes equal), the
+levels below the last drawn made by GenerateMips on a view whose
+MostDetailedMip is that level (one view kept for each such level). */
+
+#define COMPOSITE_LEVELS 16
+
+struct composite
+{
+	ID3D11Texture2D *texture;
+	ID3D11ShaderResourceView *view;
+	/* the views from a level down, for GenerateMips */
+	ID3D11ShaderResourceView *from[COMPOSITE_LEVELS];
+	uint32_t width, height, levels;
+};
+
+static struct
+{
+	struct composite *composites;
+	uint32_t count, capacity;
+	uint32_t copies;
+	int failed_logged;
+} C;
+
+static struct composite *composite_at(uint32_t handle)
+{
+	return handle && handle <= C.count && C.composites[handle - 1].texture ? &C.composites[handle - 1] : NULL;
+}
+
+uint32_t d3d11_backend_composite_create(uint32_t width, uint32_t height, uint32_t levels)
+{
+	D3D11_TEXTURE2D_DESC description;
+	struct composite *composite;
+	HRESULT result;
+
+	if (!B.device || B.lost || !width || !height || !levels || levels > COMPOSITE_LEVELS)
+		return 0;
+	if (C.count == C.capacity)
+	{
+		uint32_t capacity = C.capacity ? C.capacity * 2 : 16;
+		struct composite *grown = realloc(C.composites, capacity * sizeof(*grown));
+
+		if (!grown)
+			return 0;
+		C.composites = grown;
+		C.capacity = capacity;
+	}
+	composite = &C.composites[C.count];
+	memset(composite, 0, sizeof(*composite));
+	memset(&description, 0, sizeof(description));
+	description.Width = width;
+	description.Height = height;
+	description.MipLevels = levels;
+	description.ArraySize = 1;
+	description.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	description.SampleDesc.Count = 1;
+	description.Usage = D3D11_USAGE_DEFAULT;
+	description.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+	description.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+	result = ID3D11Device_CreateTexture2D(B.device, &description, NULL, &composite->texture);
+	if (SUCCEEDED(result))
+		result = ID3D11Device_CreateShaderResourceView(B.device, (ID3D11Resource *)composite->texture, NULL,
+			&composite->view);
+	if (backend_failed(result, "a mip composite"))
+	{
+		if (!C.failed_logged)
+		{
+			C.failed_logged = 1;
+			platform_log("d3d11: a mip composite of %ux%u, %u levels, was not made (%s): its first level's target is "
+				"sampled (logged once)", width, height, levels, hr_text(result));
+		}
+		release(&composite->view);
+		release(&composite->texture);
+		return 0;
+	}
+	composite->width = width;
+	composite->height = height;
+	composite->levels = levels;
+	return ++C.count;
+}
+
+int d3d11_backend_composite_update(uint32_t handle, const uint32_t *targets, uint32_t count)
+{
+	struct composite *composite = composite_at(handle);
+	uint32_t level, base;
+
+	if (!B.device || B.lost || !composite)
+		return 0;
+	if (count > composite->levels)
+		count = composite->levels;
+	for (level = 0; level < count; level++)
+	{
+		struct target *target = d3d11_backend_target_at(targets[level]);
+		uint32_t width = composite->width >> level ? composite->width >> level : 1;
+		uint32_t height = composite->height >> level ? composite->height >> level : 1;
+
+		if (!target || target->is_depth || target->width != width || target->height != height)
+			return 0;
+		ID3D11DeviceContext_CopySubresourceRegion(B.context, (ID3D11Resource *)composite->texture, level, 0, 0, 0,
+			(ID3D11Resource *)target->texture, 0, NULL);
+		C.copies++;
+	}
+	/* the levels the game did not draw, from the last one it did */
+	if (count < composite->levels)
+	{
+		base = count ? count - 1 : 0;
+		if (!composite->from[base])
+		{
+			D3D11_SHADER_RESOURCE_VIEW_DESC view;
+			HRESULT result;
+
+			memset(&view, 0, sizeof(view));
+			view.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+			view.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+			view.Texture2D.MostDetailedMip = base;
+			view.Texture2D.MipLevels = composite->levels - base;
+			result = ID3D11Device_CreateShaderResourceView(B.device, (ID3D11Resource *)composite->texture, &view,
+				&composite->from[base]);
+			if (backend_failed(result, "a mip composite's view"))
+				return 0;
+		}
+		ID3D11DeviceContext_GenerateMips(B.context, composite->from[base]);
+	}
+	return 1;
+}
 
 ID3D11ShaderResourceView *d3d11_backend_composite_view(uint32_t handle)
 {
-	(void)handle;
-	return NULL;
+	struct composite *composite = composite_at(handle);
+
+	return composite ? composite->view : NULL;
 }
 
 /* ---------- the statistics, the release */
@@ -330,6 +460,7 @@ void d3d11_backend_textures_statistics(uint32_t counts[D3D11_BACKEND_DRAW_STATIS
 	counts[D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_WRITE_BYTES] = T.write_bytes;
 	counts[D3D11_BACKEND_DRAW_STATISTIC_TEXTURES_ALIVE] = T.alive;
 	counts[D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_BYTES] = T.alive_bytes;
+	counts[D3D11_BACKEND_DRAW_STATISTIC_COMPOSITE_COPIES] = C.copies;
 }
 
 void d3d11_backend_textures_release(void)
@@ -345,4 +476,15 @@ void d3d11_backend_textures_release(void)
 	free(T.textures);
 	free(T.free_handles);
 	memset(&T, 0, sizeof(T));
+	for (index = 0; index < C.count; index++)
+	{
+		uint32_t level;
+
+		for (level = 0; level < COMPOSITE_LEVELS; level++)
+			release(&C.composites[index].from[level]);
+		release(&C.composites[index].view);
+		release(&C.composites[index].texture);
+	}
+	free(C.composites);
+	memset(&C, 0, sizeof(C));
 }

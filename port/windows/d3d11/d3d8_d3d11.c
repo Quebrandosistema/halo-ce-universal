@@ -99,6 +99,7 @@ the pixel entry's identity). trace_draw is back as it is.
 #include "d3d11_backend.h"
 #include "hlsl_shaders.h"
 #include "xbox_textures_d3d11.h"
+#include "zlib_prefixed.h"
 
 /* the GL calls counted by the stubs since the start (build/windows/gl_stubs.c) */
 unsigned long gl_stubs_calls(void);
@@ -198,11 +199,16 @@ static const struct
 
 #define NUMBER_OF_ANTI_ALIASING_VALUES ((int)(sizeof(anti_aliasing_values) / sizeof(anti_aliasing_values[0])))
 
-/* the value in effect, -1 until the setting is first read; and the GPU's
-largest target, which supersampling is held to: 0 while nothing is drawn
-(phase 6 asks the backend), so supersampling draws at the screen's scale */
+/* the value in effect, -1 until the setting is first read; multisampling's
+samples a pixel, at most what both target formats take
+(anti_aliasing_prepare); and the GPU's largest target, which supersampling
+is held to: 0 until the backend has a device (backend_initialize sets
+Direct3D 11's, feature level 11_0's 16,384) */
 static int anti_aliasing_value = -1;
+static int anti_aliasing_samples;
 static GLint maximum_target_size;
+
+static void anti_aliasing_prepare(void);
 
 /* display.anti_aliasing's value (none of them: the first, off) */
 static void anti_aliasing_read(void)
@@ -222,6 +228,7 @@ static void anti_aliasing_read(void)
 		platform_log("anti-aliasing: \"%s\" is unknown, so off", setting);
 	else
 		platform_log("anti-aliasing: %s", setting);
+	anti_aliasing_prepare();
 }
 
 static int anti_aliasing(void)
@@ -842,12 +849,52 @@ static GLint target_pixel(float coordinate, int axis)
 	return scaled_pixel(coordinate, target_scale[axis]);
 }
 
+/* ---------- multisampling
+
+d3d8_gl.c's: with display.anti_aliasing's multisampling, the back buffer and
+its depth buffer are drawn with samples, and so is any target drawn together
+with one of them (the mirror's view goes to the secondary target with the
+back buffer's depth buffer). The backend keeps the multisampled texture
+beside the target's own (d3d11_backend_target_multisample), and its pixels
+are resolved into the target's texture before anything reads it (a draw's
+textures, the mip composites, the screenshot, the present). A depth target
+is not resolved: Direct3D 11 resolves no depth format, and nothing samples a
+depth buffer (the game's copy of the depth buffer's memory is a target of its
+own). */
+
+/* the samples a pixel of the bound targets (or 1) */
+static int target_samples = 1;
+
+/* the multisampled pixels of a target drawn into since, into its texture */
+static void render_target_resolve(struct render_target_entry *entry)
+{
+	if (!entry->target.unresolved)
+		return;
+	entry->target.unresolved = FALSE;
+	if (entry->backend_target)
+		d3d11_backend_target_resolve(entry->backend_target);
+}
+
+/* a target drawn with these samples a pixel (0: none): its pixels resolved
+into its texture first, and the texture's put into the new storage (the
+backend's) */
+static void render_target_multisample(struct render_target_entry *entry, int samples)
+{
+	if (entry->target.samples == samples)
+		return;
+	render_target_resolve(entry);
+	if (entry->backend_target)
+		d3d11_backend_target_multisample(entry->backend_target, (uint32_t)samples);
+	entry->target.samples = samples;
+}
+
 /* binds the current targets (d3d11_backend_targets_set); returns FALSE if
 there is nothing to draw into */
 static BOOL bind_targets(BOOL *has_depth)
 {
 	struct render_target_entry *color = render_target_get(device.render_target);
 	struct render_target_entry *depth = render_target_get(device.depth_stencil);
+	int samples;
 
 	if (depth && !depth->target.depth)
 		depth = NULL;
@@ -866,6 +913,30 @@ static BOOL bind_targets(BOOL *has_depth)
 	/* viewports and clears are in the targets' units (render_target_get) */
 	target_scale[0] = color ? color->target.scale[0] : depth->target.scale[0];
 	target_scale[1] = color ? color->target.scale[1] : depth->target.scale[1];
+	/* with multisampling, multisampled where either is a screen buffer or
+	is multisampled already */
+	samples = anti_aliasing() == _anti_aliasing_msaa ? anti_aliasing_samples : 0;
+	if (samples && !((color && (color->screen_buffer || color->target.samples)) ||
+		(depth && (depth->screen_buffer || depth->target.samples))))
+	{
+		samples = 0;
+	}
+	if (color)
+		render_target_multisample(color, samples);
+	if (depth)
+		render_target_multisample(depth, samples);
+	if (samples)
+	{
+		if (color)
+			color->target.unresolved = TRUE;
+		if (depth)
+			depth->target.unresolved = TRUE;
+		target_samples = samples;
+	}
+	else
+	{
+		target_samples = 1;
+	}
 	/* a pair other than the last one bound is a target change (the game
 	names its targets again after each present) */
 	if ((color ? color->backend_target : 0) != device.bound_color ||
@@ -971,8 +1042,14 @@ static void backend_initialize(void)
 	debug_settings.dump_shaders = *config_string("debug.gpu_dump_shaders") ?
 		config_string("debug.gpu_dump_shaders") : NULL;
 	debug_settings.statistics = config_boolean("debug.gpu_stats");
+	/* (Direct3D 11's largest 2D texture at feature level 11_0,
+	D3D11_REQ_TEXTURE2D_U_OR_V_DIMENSION: supersampling is held to it) */
+	if (device.backend_ready)
+		maximum_target_size = 16384;
 	if (anti_aliasing_value < 0)
 		anti_aliasing_read();
+	else
+		anti_aliasing_prepare();
 	device.settings_read_at = config_changes() - 1;
 }
 
@@ -985,6 +1062,82 @@ static void backend_lost_check(void)
 		device.backend_ready = FALSE;
 		platform_log("Direct3D 11: the device was lost (%s); the game goes on without a picture",
 			d3d11_backend_lost_reason());
+	}
+}
+
+/* port/third_party/smaa's lookup textures, embedded by
+tools/embed_assets.py as zlib streams (xgpu_post.c's); each size 0 where the
+build had no such file */
+extern const unsigned int xgpu_smaa_area_texture[];
+extern const unsigned long xgpu_smaa_area_texture_size;
+extern const unsigned int xgpu_smaa_search_texture[];
+extern const unsigned long xgpu_smaa_search_texture_size;
+
+/* a lookup texture's texels from its zlib stream (xgpu_post.c's
+lookup_texture, without the GL texture: the backend makes it); NULL if it
+does not inflate */
+static unsigned char *lookup_texels(const unsigned int *stream, unsigned long stream_size, unsigned long size)
+{
+	uLongf inflated = (uLongf)size;
+	unsigned char *texels = malloc(size);
+	int result;
+
+	if (!texels || !stream_size)
+	{
+		free(texels);
+		return NULL;
+	}
+	result = uncompress(texels, &inflated, (const Bytef *)stream, (uLong)stream_size);
+	/* (the size says whether it is whole, as with the game's zlib 1.1,
+	which could stop short of saying the stream had ended) */
+	if ((result != Z_OK && result != Z_BUF_ERROR) || inflated != (uLongf)size)
+	{
+		free(texels);
+		return NULL;
+	}
+	return texels;
+}
+
+/* what display.anti_aliasing's value needs of the backend, once there is a
+device (d3d8_gl.c's): multisampling's samples, at most what both target
+formats take, and the passes' shaders, built as the value is chosen rather
+than in the middle of a frame (SMAA's are large); SMAA's lookup textures
+inflated here, with the port's zlib */
+static void anti_aliasing_prepare(void)
+{
+	int mode;
+
+	if (!device.backend_ready || anti_aliasing_value < 0)
+		return;
+	mode = anti_aliasing_values[anti_aliasing_value].mode;
+	anti_aliasing_samples = anti_aliasing_values[anti_aliasing_value].samples;
+	if (anti_aliasing_samples && !d3d11_backend_multisample_levels((uint32_t)anti_aliasing_samples))
+	{
+		int samples = anti_aliasing_samples;
+
+		while (samples > 2 && !d3d11_backend_multisample_levels((uint32_t)samples))
+			samples /= 2;
+		if (!d3d11_backend_multisample_levels((uint32_t)samples))
+			samples = 0;
+		platform_log("anti-aliasing: the GPU takes at most %d samples a pixel", samples);
+		anti_aliasing_samples = samples;
+	}
+	if (mode == _anti_aliasing_fxaa || mode == _anti_aliasing_smaa)
+	{
+		int smaa = mode == _anti_aliasing_smaa;
+		unsigned char *area = NULL, *search = NULL;
+		int ready;
+
+		if (smaa)
+		{
+			area = lookup_texels(xgpu_smaa_area_texture, xgpu_smaa_area_texture_size, 160UL * 560UL * 2UL);
+			search = lookup_texels(xgpu_smaa_search_texture, xgpu_smaa_search_texture_size, 64UL * 16UL);
+		}
+		ready = d3d11_backend_anti_alias_prepare(smaa, area, search);
+		free(area);
+		free(search);
+		if (!ready)
+			platform_log("anti-aliasing: its shaders do not build, so the 3D view is not antialiased");
 	}
 }
 
@@ -2484,6 +2637,96 @@ static struct render_target_entry *render_target_find(unsigned long data)
 	return best;
 }
 
+/* ---------- the mip composites
+
+d3d8_gl.c's mip_composite_get: a texture whose levels the game draws one by
+one, each into a render target of its own (the water's ripples), sampled as
+one texture with all its levels. The backend's composite
+(d3d11_backend_composite_create) has the levels; those the game drew are
+copied from their targets (resolved first) when a level's target changed or
+was written since, and the levels below the last drawn are made from it. */
+#define MIP_COMPOSITE_LEVELS 16
+
+struct mip_composite
+{
+	struct mip_composite *next;
+	unsigned long data, width, height, levels;
+	/* the backend's composite, 0 if it was not made (the plain target is
+	sampled then) */
+	uint32_t handle;
+	/* the levels last copied, and each one's target and written serial then */
+	unsigned long rendered_levels;
+	uint32_t level_sources[MIP_COMPOSITE_LEVELS];
+	unsigned long level_written[MIP_COMPOSITE_LEVELS];
+};
+
+static struct mip_composite *mip_composites;
+
+static uint32_t mip_composite_get(const struct xgpu_texture_description *description, unsigned long data)
+{
+	struct mip_composite *composite;
+	struct render_target_entry *targets[MIP_COMPOSITE_LEVELS];
+	uint32_t handles[MIP_COMPOSITE_LEVELS];
+	unsigned long level, rendered_levels = 0;
+	BOOL changed;
+
+	for (composite = mip_composites; composite; composite = composite->next)
+	{
+		if (composite->data == data && composite->width == description->width &&
+			composite->height == description->height && composite->levels == description->levels)
+		{
+			break;
+		}
+	}
+	if (!composite)
+	{
+		composite = calloc(1, sizeof(*composite));
+		if (!composite)
+			return 0;
+		composite->data = data;
+		composite->width = description->width;
+		composite->height = description->height;
+		composite->levels = description->levels;
+		composite->handle = d3d11_backend_composite_create((uint32_t)description->width,
+			(uint32_t)description->height, (uint32_t)description->levels);
+		composite->rendered_levels = ~0UL;
+		composite->next = mip_composites;
+		mip_composites = composite;
+	}
+	if (!composite->handle)
+		return 0;
+	for (level = 0; level < description->levels && level < MIP_COMPOSITE_LEVELS; level++)
+	{
+		unsigned long width = description->width >> level ? description->width >> level : 1;
+		unsigned long height = description->height >> level ? description->height >> level : 1;
+		struct render_target_entry *target = render_target_find(data + xgpu_texture_level_offset(description, level));
+
+		if (!target || !target->backend_target || target->target.width != width || target->target.height != height ||
+			target->target.gl_width != width || target->target.gl_height != height)
+			break;
+		targets[level] = target;
+		rendered_levels++;
+	}
+	changed = rendered_levels != composite->rendered_levels;
+	for (level = 0; level < rendered_levels && !changed; level++)
+	{
+		changed = targets[level]->backend_target != composite->level_sources[level] ||
+			targets[level]->target.written != composite->level_written[level];
+	}
+	if (!changed)
+		return composite->handle;
+	composite->rendered_levels = rendered_levels;
+	for (level = 0; level < rendered_levels; level++)
+	{
+		composite->level_sources[level] = targets[level]->backend_target;
+		composite->level_written[level] = targets[level]->target.written;
+		render_target_resolve(targets[level]);
+		handles[level] = targets[level]->backend_target;
+	}
+	d3d11_backend_composite_update(composite->handle, handles, (uint32_t)rendered_levels);
+	return composite->handle;
+}
+
 /* what bind_textures hands configure_sampler for a stage (d3d8_gl.c): whether
 the stage has a texture, and so a sampler; whether the texture has mip levels;
 whether it is a high-res HUD texture */
@@ -2531,14 +2774,21 @@ static void key_textures(struct nv2a_pixel_shader_key *key, struct stage_samplin
 		target = render_target_find(texture->Data);
 		if (target)
 		{
+			uint32_t composite = 0;
+
+			/* (multisampled: its pixels drawn since, resolved) */
+			render_target_resolve(target);
 			xgpu_texture_describe(texture->Format, texture->Size, &description);
-			sampling[stage].mipmapped = !description.linear && !description.cube_map && description.levels > 1 &&
-				target->target.width == description.width && target->target.height == description.height;
 			key->sampler_type[stage] = _xgpu_sampler_2d;
-			/* (the target's pixels, as bind_textures samples them; a linear
-			texture's coordinates in its texels) */
-			device.draw.textures[stage].kind = D3D11_BACKEND_TEXTURE_TARGET;
-			device.draw.textures[stage].handle = target->backend_target;
+			/* (the target's pixels, as bind_textures samples them, or its
+			mip chain's composite; a linear texture's coordinates in its
+			texels) */
+			if (!description.linear && !description.cube_map && description.levels > 1 &&
+				target->target.width == description.width && target->target.height == description.height)
+				composite = mip_composite_get(&description, texture->Data);
+			sampling[stage].mipmapped = composite != 0;
+			device.draw.textures[stage].kind = composite ? D3D11_BACKEND_TEXTURE_COMPOSITE : D3D11_BACKEND_TEXTURE_TARGET;
+			device.draw.textures[stage].handle = composite ? composite : target->backend_target;
 			if (description.linear)
 			{
 				texture_scale[stage][0] = 1.0f / (float)target->target.width;
@@ -2573,9 +2823,10 @@ static void key_textures(struct nv2a_pixel_shader_key *key, struct stage_samplin
 	}
 }
 
-/* prepare_draw's key (d3d8_gl.c), without GL: alpha_test_samples stays 0
-(the target's samples are phase 6's) and count_samples 0 (the visibility
-tests are occlusion queries, phase 6); and each stage's sampling */
+/* prepare_draw's key (d3d8_gl.c), without GL: alpha_test_samples is set by
+draw_prepare once the targets are bound (their samples), and count_samples
+stays 0 (the visibility tests are occlusion queries); and each stage's
+sampling */
 static void pixel_key_make(struct nv2a_pixel_shader_key *key, struct stage_sampling sampling[D3DTSS_MAXSTAGES],
 	float texture_scale[D3DTSS_MAXSTAGES][4])
 {
@@ -3460,6 +3711,8 @@ static void rasterizer_description(struct d3d11_backend_rasterizer *rasterizer)
 	}
 	rasterizer->depth_clip = 1;
 	rasterizer->scissor = 1;
+	/* (the bound targets' samples: line rasterization follows it) */
+	rasterizer->multisample = target_samples > 1;
 }
 
 /* configure_sampler's inputs (d3d8_gl.c): the stage's state, or the
@@ -3797,6 +4050,10 @@ static BOOL draw_prepare(BOOL immediate)
 		stats.skipped_no_target++;
 		return FALSE;
 	}
+	/* (the alpha test on every sample of a multisampled target, without
+	blending: SV_Coverage, the key's ps_4_1 shader) */
+	if (target_samples > 1 && key.alpha_test_function && !D3D__RenderState[D3DRS_ALPHABLENDENABLE])
+		key.alpha_test_samples = (unsigned char)target_samples;
 	if (program->lighting.lights && !program->lighting_failed && per_pixel_lighting())
 	{
 		key.per_pixel_lighting = (unsigned char)program->lighting.lights;
@@ -4697,14 +4954,29 @@ void WINAPI D3DDevice_Clear(DWORD count, CONST D3DRECT *rectangles, DWORD flags,
 /* ---------- the anti-aliasing passes */
 
 /* display.anti_aliasing's pass over a window's 3D view, before the HUD and
-menus are drawn over it (source/render/render.c): phase 6's, with nothing
-drawn yet */
+menus are drawn over it (source/render/render.c); the window's bounds in the
+game's units of the screen (d3d8_gl.c's, the passes the backend's:
+win32_d3d11_post.c) */
 void halo_screen_anti_alias(short x0, short y0, short x1, short y1)
 {
-	(void)x0;
-	(void)y0;
-	(void)x1;
-	(void)y1;
+	struct render_target_entry *target;
+	int32_t corners[4];
+	int mode = anti_aliasing();
+
+	if (!device.backend_ready || (mode != _anti_aliasing_fxaa && mode != _anti_aliasing_smaa))
+		return;
+	/* (the primary target's view: the back buffer's) */
+	target = render_target_get(&device.back_buffer);
+	if (!target || !target->backend_target)
+		return;
+	/* (no longer multisampled, if it was before the setting changed) */
+	render_target_multisample(target, 0);
+	corners[0] = scaled_pixel(x0, target->target.scale[0]);
+	corners[1] = scaled_pixel(y0, target->target.scale[1]);
+	corners[2] = scaled_pixel(x1, target->target.scale[0]);
+	corners[3] = scaled_pixel(y1, target->target.scale[1]);
+	d3d11_backend_anti_alias(mode == _anti_aliasing_smaa, target->backend_target, corners);
+	backend_lost_check();
 }
 
 /* ---------- presentation */
@@ -4790,6 +5062,7 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			if (trace_frame())
 				platform_log("present back buffer %08lx target %lu", (unsigned long)device.back_buffer.Data,
 					(unsigned long)back_buffer->backend_target);
+			render_target_resolve(back_buffer);
 			if (screenshot_every > 0 && device.frame % (unsigned long)screenshot_every == 0)
 				write_screenshot(back_buffer);
 			platform_video_drawable_size(&window_width, &window_height);
@@ -4854,7 +5127,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("frame %lu: Direct3D 11; %lu draws, %lu immediate; skipped in 60 frames: %lu no "
 			"program, %lu no buffer, %lu no target, %lu not drawn; %lu clears (%lu by clear calls, %lu drawn), "
 			"%lu target changes, %lu targets; %lu KB mirrored, %lu KB streamed, %lu KB uploaded to %lu segments, %lu ring "
-			"discards; %lu binds skipped, %lu self-sampling copies; %lu textures (%lu KB), %lu texture writes (%lu KB); "
+			"discards; %lu binds skipped, %lu self-sampling copies, %lu resolves, %lu composite copies; %lu textures (%lu "
+			"KB), %lu texture writes (%lu KB); "
 			"%lu pixel keys, %lu vertex variants met; %lu presented, "
 			"%lu not; %lu swap chain resizes; %lu GL stub calls%s",
 			device.frame, stats.draws / stats.presents, stats.immediate_draws / stats.presents,
@@ -4869,6 +5143,10 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_BINDS_SKIPPED]),
 			(unsigned long)(drawn[D3D11_BACKEND_DRAW_STATISTIC_SELF_SAMPLING_COPIES] -
 				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_SELF_SAMPLING_COPIES]),
+			(unsigned long)(drawn[D3D11_BACKEND_DRAW_STATISTIC_RESOLVES] -
+				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_RESOLVES]),
+			(unsigned long)(drawn[D3D11_BACKEND_DRAW_STATISTIC_COMPOSITE_COPIES] -
+				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_COMPOSITE_COPIES]),
 			(unsigned long)drawn[D3D11_BACKEND_DRAW_STATISTIC_TEXTURES_ALIVE],
 			(unsigned long)drawn[D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_BYTES] / 1024,
 			(unsigned long)(drawn[D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_WRITES] -

@@ -76,6 +76,18 @@ uint32_t d3d11_backend_target_create(uint32_t pixel_width, uint32_t pixel_height
 /* how many targets exist */
 uint32_t d3d11_backend_targets_alive(void);
 
+/* multisampling (display.anti_aliasing's msaa values, phase 6 step 5): 1
+when both target formats take this many samples a pixel
+(CheckMultisampleQualityLevels); the target given a multisampled texture of
+these samples (below 2: none), which its binds and clears use from then on,
+with the colour target's pixels copied in (a depth target's cleared), the
+device having resolved it first; the colour target's multisampled pixels
+resolved into its texture (a depth target is not: Direct3D 11 resolves no
+depth format, and nothing samples one) */
+int d3d11_backend_multisample_levels(uint32_t samples);
+void d3d11_backend_target_multisample(uint32_t handle, uint32_t samples);
+void d3d11_backend_target_resolve(uint32_t handle);
+
 /* the targets later clears (and, from phase 6, draws) go to; either 0 */
 void d3d11_backend_targets_set(uint32_t color, uint32_t depth);
 
@@ -510,6 +522,29 @@ int d3d11_backend_texture_read(uint32_t handle, void *pixels, size_t size);
 void d3d11_backend_texture_free(uint32_t handle);
 /* how many textures exist, and the bytes they hold */
 uint32_t d3d11_backend_textures_alive(uint32_t *bytes);
+
+/* the mip composites (step 5): a B8G8R8A8 texture of width by height with
+levels levels (its handle, from 1; 0 if it was not made, logged once); the
+first count levels copied from the colour targets of those handles (each the
+level's size), the levels below the last made from it (GenerateMips). 1 if
+done. A draw samples a composite as D3D11_BACKEND_TEXTURE_COMPOSITE. */
+uint32_t d3d11_backend_composite_create(uint32_t width, uint32_t height, uint32_t levels);
+int d3d11_backend_composite_update(uint32_t handle, const uint32_t *targets, uint32_t count);
+
+/* ---------- the anti-aliasing passes (win32_d3d11_post.c, step 5)
+
+display.anti_aliasing's FXAA and SMAA over a window's 3D view, as
+xgpu_post.c runs them under OpenGL. Prepared when the setting is chosen: the
+shaders compiled (SMAA's from the embedded SMAA.hlsl) and, for SMAA, its two
+lookup textures made from their texels (area: 160x560, two bytes a texel;
+search: 64x16, one byte), which the device inflates. 1 if the pass can run;
+0 if it cannot (logged, and from then on 0). */
+int d3d11_backend_anti_alias_prepare(int smaa, const void *area, const void *search);
+
+/* the pass on the colour target (not multisampled) over corners (x0, y0, x1,
+y1 in its pixels from the top left), colour only: the game keeps values of
+its own in destination alpha. 1 if run. */
+int d3d11_backend_anti_alias(int smaa, uint32_t target, const int32_t corners[4]);
 
 /* what d3d11_backend_draw_statistics fills, totals since the start: the
 draws made; the binds the shadow skipped; the copies of a target sampled

@@ -429,7 +429,9 @@ int d3d11_backend_draw(const struct d3d11_backend_draw *draw)
 		{
 			struct target *target = d3d11_backend_target_at(texture->handle);
 
-			if (target && target == color)
+			/* (a multisampled target is drawn into its multisampled
+			texture, and its own was resolved by the device) */
+			if (target && target == color && !target->samples)
 				view = self_sampling_copy(target);
 			else
 				view = d3d11_backend_target_view(texture->handle, &width, &height);
@@ -497,6 +499,7 @@ void d3d11_backend_draw_statistics(uint32_t counts[D3D11_BACKEND_DRAW_STATISTICS
 	counts[D3D11_BACKEND_DRAW_STATISTIC_DRAWS] = D.draws;
 	counts[D3D11_BACKEND_DRAW_STATISTIC_BINDS_SKIPPED] = D.binds_skipped;
 	counts[D3D11_BACKEND_DRAW_STATISTIC_SELF_SAMPLING_COPIES] = D.self_sampling_copies;
+	counts[D3D11_BACKEND_DRAW_STATISTIC_RESOLVES] = d3d11_backend_target_resolves();
 	d3d11_backend_textures_statistics(counts);
 }
 
