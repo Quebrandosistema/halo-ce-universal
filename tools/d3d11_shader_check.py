@@ -21,8 +21,10 @@ For each .hlsl of the manifest:
   summed;
 - compared with its GLSL twin: the HLSL must be exactly the twin with the
   dialect's changes (port/windows/D3D11.md, phase 4, "The dialect", items 1 to
-  10) applied, the declarations written from hlsl_shaders.h's #defines and
-  strings, whitespace aside. A shader that compiles and draws black is the
+  10, and phase 6's item 11: a manifest line marked constant_alpha=1 or 2 has
+  the one multiply by the blend constant's alpha before the return) applied,
+  the declarations written from hlsl_shaders.h's #defines and strings,
+  whitespace aside. A shader that compiles and draws black is the
   failure this is for: it compiles, so only a comparison finds it.
 
 Then the keys: the distinct keys and how many values each field takes (a field
@@ -336,6 +338,11 @@ def expected_pixel(gl_text, entry, macros):
             continue
         match = re.match(r"fragment_color = (.*);$", stripped)
         if match:
+            # item 11 (phase 6): the manifest's constant_alpha mark means the one multiply line before the return
+            if entry.get("constant_alpha") == "1":
+                body.append("result *= blend_constant.w;")
+            elif entry.get("constant_alpha") == "2":
+                body.append("result *= 1.0 - blend_constant.w;")
             if coverage:
                 body.append("output.color = %s;" % match.group(1))
                 body.append("return output;")

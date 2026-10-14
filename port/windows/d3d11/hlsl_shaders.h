@@ -29,7 +29,7 @@ include it; the key and the lighting are named by pointer only (xgpu.h).
 
 /* in every shader's identity (phase 5's cache): a change to the generators'
 text is a new version */
-#define HLSL_SHADER_GENERATOR_VERSION 1
+#define HLSL_SHADER_GENERATOR_VERSION 2
 
 #define HLSL_STRING(x) #x
 #define HLSL_REGISTER_TEXT(x) HLSL_STRING(x)
@@ -106,7 +106,13 @@ in its order) */
 #define HLSL_PIXEL_PARAMETERS_BUMP_LUMINANCE_REGISTER 25
 #define HLSL_PIXEL_PARAMETERS_TEXTURE_SCALE 464
 #define HLSL_PIXEL_PARAMETERS_TEXTURE_SCALE_REGISTER 29
-#define HLSL_PIXEL_PARAMETERS_SIZE 528
+/* D3DRS_BLENDCOLOR's channels: a draw whose source factor is the constant's
+alpha and whose destination factor is the constant's colour (the transparent
+meter's blend, the one such pair) multiplies its colour by w in the shader,
+since Direct3D 11 has one blend factor for both (phase 6) */
+#define HLSL_PIXEL_PARAMETERS_BLEND_CONSTANT 528
+#define HLSL_PIXEL_PARAMETERS_BLEND_CONSTANT_REGISTER 33
+#define HLSL_PIXEL_PARAMETERS_SIZE 544
 
 /* the per-pixel model lighting's constants (xgpu.h XGPU_MODEL_LIGHT_COUNT),
 declared by the lit pixel shaders only */
@@ -129,6 +135,7 @@ declared by the lit pixel shaders only */
 	"\tfloat4 bump_matrix[4] : packoffset(c" HLSL_REGISTER_TEXT(HLSL_PIXEL_PARAMETERS_BUMP_MATRIX_REGISTER) ");\n" \
 	"\tfloat4 bump_luminance[4] : packoffset(c" HLSL_REGISTER_TEXT(HLSL_PIXEL_PARAMETERS_BUMP_LUMINANCE_REGISTER) ");\n" \
 	"\tfloat4 texture_scale[4] : packoffset(c" HLSL_REGISTER_TEXT(HLSL_PIXEL_PARAMETERS_TEXTURE_SCALE_REGISTER) ");\n" \
+	"\tfloat4 blend_constant : packoffset(c" HLSL_REGISTER_TEXT(HLSL_PIXEL_PARAMETERS_BLEND_CONSTANT_REGISTER) ");\n" \
 	"};\n"
 
 #define HLSL_MODEL_LIGHTS_TEXT \
@@ -151,6 +158,7 @@ struct hlsl_pixel_parameters
 	float bump_matrix[4][4];
 	float bump_luminance[4][4];
 	float texture_scale[4][4];
+	float blend_constant[4];
 };
 
 struct hlsl_model_lights
@@ -192,6 +200,7 @@ HLSL_PIXEL_MEMBER_ASSERT(alpha_reference, ALPHA_REFERENCE);
 HLSL_PIXEL_MEMBER_ASSERT(bump_matrix, BUMP_MATRIX);
 HLSL_PIXEL_MEMBER_ASSERT(bump_luminance, BUMP_LUMINANCE);
 HLSL_PIXEL_MEMBER_ASSERT(texture_scale, TEXTURE_SCALE);
+HLSL_PIXEL_MEMBER_ASSERT(blend_constant, BLEND_CONSTANT);
 #undef HLSL_PIXEL_MEMBER_ASSERT
 _Static_assert(sizeof(struct hlsl_pixel_parameters) == HLSL_PIXEL_PARAMETERS_SIZE, "pixel_parameters size");
 
@@ -323,7 +332,15 @@ char *nv2a_hlsl_vertex_shader(const uint32_t *instructions, uint32_t count, uint
 /* HLSL for a pixel shader key (nv2a_pixel_shader_to_glsl's, xgpu.h), and its
 target in target: HLSL_PIXEL_TARGET, or HLSL_PIXEL_COVERAGE_TARGET for a
 multisampled alpha test (alpha_test_samples), which writes SV_Coverage.
-Entry HLSL_ENTRY. Returns a malloc'd string. */
-char *nv2a_hlsl_pixel_shader(const struct nv2a_pixel_shader_key *key, char target[8]);
+by_constant_alpha (0, 1, or 2 for the inverse) multiplies the colour, all
+four channels, by blend_constant.w or 1 - blend_constant.w after the alpha
+test and before the return: the draw whose source blend factor is the
+constant's alpha and whose destination factor is the constant's colour (the
+transparent meter's), which Direct3D 11's one blend factor cannot give; its
+source factors are then ONE. Entry HLSL_ENTRY. Returns a malloc'd string. */
+#define HLSL_BY_CONSTANT_ALPHA_NONE 0
+#define HLSL_BY_CONSTANT_ALPHA 1
+#define HLSL_BY_INVERSE_CONSTANT_ALPHA 2
+char *nv2a_hlsl_pixel_shader(const struct nv2a_pixel_shader_key *key, int by_constant_alpha, char target[8]);
 
 #endif

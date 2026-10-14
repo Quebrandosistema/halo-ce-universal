@@ -65,6 +65,25 @@ stage's sampler, translated from the Xbox's enumerants as apply_raster_state
 and configure_sampler read them. The handles are kept in device.draw for phase
 6 to bind; nothing is bound or drawn yet. debug.d3d11_self_test's fourth line
 is the service's.
+
+Phase 6: the draw. prepare_draw (d3d8_gl.c) is back whole in draw_note's
+place as draw_prepare, in its order, with the backend's calls where the GL
+was: the key and the textures, the targets after them (bind_targets), the
+state objects, the shaders, the constant buffers (one DYNAMIC buffer for
+every program's vertex constants, written whole when the serial moved; the
+model lights; the other uniforms as hlsl_shaders.h's two structures, each
+written when its inputs changed), then the record (d3d11_backend.h, struct
+d3d11_backend_draw: the handles, the dynamic values, the viewport and its
+depth range, the streams stream_data placed, the attribute slot's sixteen
+values with zeros for a packed register, the primitives) and the backend's
+draw where glDrawArrays and glDrawElementsBaseVertex were. Direct3D 11 has
+no fan, no loop and no quads: quad lists, fans, polygons and line loops are
+drawn from indices made for the draw (quad_indices, fan_indices,
+loop_indices). The transparent meter's blend (the source factor the
+constant's alpha, the destination's the constant's colour, which Direct3D
+11's one blend factor cannot give) is drawn with the source factors ONE and
+the pixel shader multiplying by the constant's alpha (by_constant_alpha, in
+the pixel entry's identity). trace_draw is back as it is.
 */
 
 #include "xgpu.h"
@@ -450,19 +469,17 @@ struct d3d11_device
 	debug.d3d11_present_marker, as of config_changes()'s count read_at */
 	BOOL vsync;
 	unsigned long settings_read_at;
-	/* the swap chain's resizes, and the rings' discards, when the statistics
-	last said */
+	/* the swap chain's resizes, the rings' discards and the draw unit's
+	counts when the statistics last said */
 	uint32_t resizes_before;
 	uint32_t discards_before;
-	/* what the draw noted last would bind (draw_note), the backend's handles:
-	its shaders, its input layout, its state objects and a sampler for each
-	stage with a texture (0 for one without); phase 6 binds them */
-	struct
-	{
-		uint32_t vertex_shader, pixel_shader, layout;
-		uint32_t blend, depth_stencil, rasterizer;
-		uint32_t samplers[D3DTSS_MAXSTAGES];
-	} draw;
+	uint32_t draw_statistics_before[D3D11_BACKEND_DRAW_STATISTICS];
+	/* the draw's record (draw_prepare fills it, stream_data and the entry
+	points place its data, draw_submit hands it to the backend): the
+	shaders, the input layout, the state objects and a sampler for each stage
+	with a texture (0 for one without), the dynamic values, the streams, the
+	attribute slot's values, the indices, the topology, the textures */
+	struct d3d11_backend_draw draw;
 	/* the shader service's statistics after the self-tests
 	(backend_initialize): the statistics line gives the game's, since */
 	uint32_t shader_statistics_before[D3D11_BACKEND_STATISTICS];
@@ -477,7 +494,7 @@ and the debug layer's messages */
 static struct
 {
 	unsigned long draws, immediate_draws, clears, presents;
-	unsigned long skipped_no_program, skipped_no_buffer;
+	unsigned long skipped_no_program, skipped_no_buffer, skipped_no_target, skipped_textures, skipped_not_drawn;
 	unsigned long clears_by_calls, clears_drawn;
 	unsigned long target_changes;
 	/* vertex and index bytes drawn from the mirror, and streamed (as
@@ -976,17 +993,11 @@ drew with what it last uploaded (another object's node matrices: vertices
 flung across the screen for a frame). */
 static unsigned long long constant_serials[XGPU_VERTEX_CONSTANT_COUNT];
 static unsigned long long constants_serial;
-/* the register each of the latest serials changed, so a program that is
-only a little behind finds its changed registers without a full scan */
-#define CONSTANT_LOG_SIZE 1024
-static unsigned char constant_log[CONSTANT_LOG_SIZE];
-/* the registers changed since the last upload (to any program): the
-smallest and largest, and the serial that upload was current to. A program
-current to that serial needs them, and nothing in the log. The serial is
-64-bit as the others are (cut to 32, it matched a program left at an old
-serial, which then took only the checkpoint's registers). */
-static unsigned long long constants_checkpoint_serial;
-static unsigned long constants_checkpoint_first = XGPU_VERTEX_CONSTANT_COUNT, constants_checkpoint_last;
+/* (d3d8_gl.c's log of the latest changed registers and its checkpoint found
+the range one program's uniform array needed among many programs'; here one
+constant buffer serves every program and is written whole when the serial
+moved, with a DISCARD map, which must write the whole buffer anyway: phase 6
+records the difference) */
 
 static void constants_store(unsigned long first, const void *data, unsigned long count)
 {
@@ -999,11 +1010,6 @@ static void constants_store(unsigned long first, const void *data, unsigned long
 		{
 			memcpy(device.constants[first + index], values[index], sizeof(device.constants[0]));
 			constant_serials[first + index] = ++constants_serial;
-			constant_log[constants_serial % CONSTANT_LOG_SIZE] = (unsigned char)(first + index);
-			if (constants_checkpoint_first > first + index)
-				constants_checkpoint_first = first + index;
-			if (constants_checkpoint_last < first + index)
-				constants_checkpoint_last = first + index;
 		}
 	}
 }
@@ -2043,8 +2049,9 @@ the GL renderer named its stream buffer there */
 #define STREAMED_IN_RING 0xffffffffu
 
 /* setup_streams' data work (d3d8_gl.c): each stream the draw's declaration
-reads, from the mirror where it can be, else streamed; the vertex array, its
-buffers and the attributes' values are phase 6's */
+reads, from the mirror where it can be, else streamed, placed in the record
+(the segment or the ring, the offset, the stride: the layout's elements name
+the slots, draw_layout); the attributes' values are draw_prepare's */
 static void stream_data(unsigned long first, unsigned long count)
 {
 	struct vertex_shader_object *declaration = device.vertex_shader;
@@ -2053,6 +2060,7 @@ static void stream_data(unsigned long first, unsigned long count)
 	BOOL placed[16] = { FALSE };
 	unsigned long index, total = 0;
 
+	memset(device.draw.streams, 0, sizeof(device.draw.streams));
 	/* the mirror first; then one reservation for everything streamed */
 	for (index = 0; index < declaration->element_count; index++)
 	{
@@ -2090,14 +2098,35 @@ static void stream_data(unsigned long first, unsigned long count)
 			stream_buffers[stream] = STREAMED_IN_RING;
 			stats.streamed_bytes += bytes;
 		}
-		/* (the element's attribute in the vertex layout, layout_attribute,
-		and the streams it uses: phase 6) */
+		/* (state_vertex_buffer: the slot's buffer and offset, in the record) */
+		device.draw.streams[stream].kind = stream_buffers[stream] == STREAMED_IN_RING ? D3D11_BACKEND_DATA_RING :
+			D3D11_BACKEND_DATA_SEGMENT;
+		device.draw.streams[stream].segment = stream_buffers[stream] == STREAMED_IN_RING ? 0 : stream_buffers[stream];
+		device.draw.streams[stream].offset = (uint32_t)stream_offsets[stream];
+		device.draw.streams[stream].stride = (uint32_t)stride;
 	}
-	/* (the vertex array from the layout, vertex_array_get and
-	state_vertex_array; each stream used bound at its buffer and offset,
-	state_vertex_buffer; the attributes no element feeds given their current
-	values, state_attribute_value: phase 6) */
-	(void)stream_offsets;
+}
+
+/* the record's indices: none (a plain draw of count vertices), or count of
+them in the index ring or a segment at offset, counting from base_vertex */
+static void draw_indices_none(unsigned long count)
+{
+	device.draw.index_kind = D3D11_BACKEND_DATA_NONE;
+	device.draw.index_segment = 0;
+	device.draw.index_offset = 0;
+	device.draw.index_count = 0;
+	device.draw.base_vertex = 0;
+	device.draw.vertex_count = (uint32_t)count;
+}
+
+static void draw_indices_at(uint32_t kind, uint32_t segment, unsigned long offset, unsigned long count, long base_vertex)
+{
+	device.draw.index_kind = kind;
+	device.draw.index_segment = segment;
+	device.draw.index_offset = (uint32_t)offset;
+	device.draw.index_count = (uint32_t)count;
+	device.draw.base_vertex = (int32_t)base_vertex;
+	device.draw.vertex_count = 0;
 }
 
 /* quads become two triangles each */
@@ -2123,6 +2152,72 @@ static WORD *quad_indices(const WORD *indices, unsigned long count, unsigned lon
 	}
 	*out_count = quads * 6;
 	return result;
+}
+
+/* a triangle fan or a polygon (Direct3D 11 has neither) as the triangles
+(0, i, i + 1), or of an indexed draw (i0, ii, ii + 1) */
+static WORD *fan_indices(const WORD *indices, unsigned long count, unsigned long *out_count)
+{
+	unsigned long triangles = count >= 3 ? count - 2 : 0;
+	WORD *result = malloc(triangles * 3 * sizeof(WORD) + 2);
+	unsigned long triangle;
+
+	for (triangle = 0; triangle < triangles; triangle++)
+	{
+		result[triangle * 3 + 0] = indices ? indices[0] : (WORD)0;
+		result[triangle * 3 + 1] = indices ? indices[triangle + 1] : (WORD)(triangle + 1);
+		result[triangle * 3 + 2] = indices ? indices[triangle + 2] : (WORD)(triangle + 2);
+	}
+	*out_count = triangles * 3;
+	return result;
+}
+
+/* a line loop (Direct3D 11 has none) as a line strip with its first vertex
+again at its end */
+static WORD *loop_indices(const WORD *indices, unsigned long count, unsigned long *out_count)
+{
+	WORD *result = malloc((count + 1) * sizeof(WORD) + 2);
+	unsigned long index;
+
+	for (index = 0; index < count; index++)
+		result[index] = indices ? indices[index] : (WORD)index;
+	result[count] = count ? result[0] : 0;
+	*out_count = count ? count + 1 : 0;
+	return result;
+}
+
+/* whether the primitive type is drawn from indices made for the draw
+(quad_indices, fan_indices, loop_indices) */
+static BOOL primitive_made(D3DPRIMITIVETYPE type)
+{
+	return type == D3DPT_QUADLIST || type == D3DPT_TRIANGLEFAN || type == D3DPT_POLYGON || type == D3DPT_LINELOOP;
+}
+
+static WORD *made_indices(D3DPRIMITIVETYPE type, const WORD *indices, unsigned long count, unsigned long *out_count)
+{
+	switch (type)
+	{
+	case D3DPT_QUADLIST: return quad_indices(indices, count, out_count);
+	case D3DPT_LINELOOP: return loop_indices(indices, count, out_count);
+	default: return fan_indices(indices, count, out_count);
+	}
+}
+
+/* primitive_mode (d3d8_gl.c) as Direct3D 11's topologies: a quad strip is a
+triangle strip, a fan, a polygon and a quad list are triangles from made
+indices, a line loop a strip from them */
+static uint32_t primitive_topology(D3DPRIMITIVETYPE type)
+{
+	switch (type)
+	{
+	case D3DPT_POINTLIST: return D3D11_BACKEND_TOPOLOGY_POINTLIST;
+	case D3DPT_LINELIST: return D3D11_BACKEND_TOPOLOGY_LINELIST;
+	case D3DPT_LINELOOP:
+	case D3DPT_LINESTRIP: return D3D11_BACKEND_TOPOLOGY_LINESTRIP;
+	case D3DPT_TRIANGLESTRIP:
+	case D3DPT_QUADSTRIP: return D3D11_BACKEND_TOPOLOGY_TRIANGLESTRIP;
+	default: return D3D11_BACKEND_TOPOLOGY_TRIANGLELIST;
+	}
 }
 
 /* ---------- the shaders a draw would use (phase 4)
@@ -2220,7 +2315,8 @@ configure_sampler is given it: a render target's levels only where
 bind_textures composites its mip chain (mip_composite_get), a bitmap's from
 its description, and high-res where the HUD has a texture for it (on any
 stage, as xbox_textures.c finds it). */
-static void key_textures(struct nv2a_pixel_shader_key *key, struct stage_sampling sampling[D3DTSS_MAXSTAGES])
+static void key_textures(struct nv2a_pixel_shader_key *key, struct stage_sampling sampling[D3DTSS_MAXSTAGES],
+	float texture_scale[D3DTSS_MAXSTAGES][4])
 {
 	int stage;
 
@@ -2232,6 +2328,10 @@ static void key_textures(struct nv2a_pixel_shader_key *key, struct stage_samplin
 		struct render_target_entry *target;
 
 		memset(&sampling[stage], 0, sizeof(sampling[stage]));
+		texture_scale[stage][0] = texture_scale[stage][1] = 1.0f;
+		texture_scale[stage][2] = texture_scale[stage][3] = 1.0f;
+		device.draw.textures[stage].kind = D3D11_BACKEND_TEXTURE_NONE;
+		device.draw.textures[stage].handle = 0;
 		if (!texture || !texture->Data || mode == 0 || mode == 0x04 || mode == 0x05 || mode == 0x11)
 		{
 			key->sampler_type[stage] = mode == 0x11 ? _xgpu_sampler_2d : _xgpu_sampler_none;
@@ -2246,6 +2346,15 @@ static void key_textures(struct nv2a_pixel_shader_key *key, struct stage_samplin
 			sampling[stage].mipmapped = !description.linear && !description.cube_map && description.levels > 1 &&
 				target->target.width == description.width && target->target.height == description.height;
 			key->sampler_type[stage] = _xgpu_sampler_2d;
+			/* (the target's pixels, as bind_textures samples them; a linear
+			texture's coordinates in its texels) */
+			device.draw.textures[stage].kind = D3D11_BACKEND_TEXTURE_TARGET;
+			device.draw.textures[stage].handle = target->backend_target;
+			if (description.linear)
+			{
+				texture_scale[stage][0] = 1.0f / (float)target->target.width;
+				texture_scale[stage][1] = 1.0f / (float)target->target.height;
+			}
 			continue;
 		}
 		xgpu_texture_describe(texture->Format, texture->Size, &description);
@@ -2272,7 +2381,8 @@ static void key_textures(struct nv2a_pixel_shader_key *key, struct stage_samplin
 /* prepare_draw's key (d3d8_gl.c), without GL: alpha_test_samples stays 0
 (the target's samples are phase 6's) and count_samples 0 (the visibility
 tests are occlusion queries, phase 6); and each stage's sampling */
-static void pixel_key_make(struct nv2a_pixel_shader_key *key, struct stage_sampling sampling[D3DTSS_MAXSTAGES])
+static void pixel_key_make(struct nv2a_pixel_shader_key *key, struct stage_sampling sampling[D3DTSS_MAXSTAGES],
+	float texture_scale[D3DTSS_MAXSTAGES][4])
 {
 	int stage;
 
@@ -2284,7 +2394,7 @@ static void pixel_key_make(struct nv2a_pixel_shader_key *key, struct stage_sampl
 	key->combiner_state[D3DRS_PSFINALCOMBINERCONSTANT0] = 0;
 	key->combiner_state[D3DRS_PSFINALCOMBINERCONSTANT1] = 0;
 	key->texture_modes = D3D__RenderState[D3DRS_PSTEXTUREMODES];
-	key_textures(key, sampling);
+	key_textures(key, sampling, texture_scale);
 	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
 	{
 		key->alpha_kill[stage] = D3D__TextureState[stage][D3DTSS_ALPHAKILL] == D3DTALPHAKILL_ENABLE;
@@ -2307,6 +2417,11 @@ struct pixel_entry
 	struct pixel_entry *next;
 	unsigned long hash;
 	struct nv2a_pixel_shader_key key;
+	/* the draw blends with the source factor the constant's alpha and the
+	destination's the constant's colour (the transparent meter): the shader
+	multiplies by the alpha (HLSL_BY_CONSTANT_ALPHA, or the inverse), beside
+	the key and in the identity */
+	int by_constant_alpha;
 	uint64_t identity;
 	uint32_t handle;
 	/* its compile failed: its draws are skipped for the run */
@@ -2358,12 +2473,14 @@ static struct
 	unsigned long layout_types[256];
 } shaders_met;
 
-/* a pixel shader's identity: the generator's version and the key's bytes */
-static uint64_t pixel_identity(const struct nv2a_pixel_shader_key *key)
+/* a pixel shader's identity: the generator's version, the key's bytes and
+the constant-alpha flag */
+static uint64_t pixel_identity(const struct nv2a_pixel_shader_key *key, int by_constant_alpha)
 {
-	uint32_t version = HLSL_SHADER_GENERATOR_VERSION;
+	uint32_t version = HLSL_SHADER_GENERATOR_VERSION, flag = (uint32_t)by_constant_alpha;
 
-	return shader_hash(shader_hash(SHADER_HASH_START, &version, sizeof(version)), key, sizeof(*key));
+	return shader_hash(shader_hash(shader_hash(SHADER_HASH_START, &version, sizeof(version)), key, sizeof(*key)),
+		&flag, sizeof(flag));
 }
 
 /* a vertex shader's: the generator's version, the program's words, the three
@@ -2481,16 +2598,19 @@ static void dump_pixel_entry(const struct pixel_entry *entry)
 	char *text;
 
 	snprintf(name, sizeof(name), "ps%016llx", (unsigned long long)entry->identity);
-	text = nv2a_hlsl_pixel_shader(&entry->key, target);
+	text = nv2a_hlsl_pixel_shader(&entry->key, entry->by_constant_alpha, target);
 	if (text)
 	{
 		snprintf(file, sizeof(file), "%s.hlsl", name);
 		if (dump_file(file, text, strlen(text), TRUE))
 		{
 			/* (d3d8_gl.c's fragment_shader_get names its dump by the key's
-			hash_words) */
-			dump_manifest_line("%s stage=pixel entry=%s target=%s program=%lu gl=ps_%08lx.glsl", file, HLSL_ENTRY,
-				target, current_program() ? current_program()->id : 0, entry->hash);
+			hash_words; the constant-alpha mark is the dialect's item 11 for
+			tools/d3d11_shader_check.py: the twin is the unflagged text) */
+			dump_manifest_line("%s stage=pixel entry=%s target=%s program=%lu gl=ps_%08lx.glsl%s", file, HLSL_ENTRY,
+				target, current_program() ? current_program()->id : 0, entry->hash,
+				entry->by_constant_alpha == HLSL_BY_CONSTANT_ALPHA ? " constant_alpha=1" :
+				entry->by_constant_alpha == HLSL_BY_INVERSE_CONSTANT_ALPHA ? " constant_alpha=2" : "");
 		}
 		free(text);
 	}
@@ -2511,7 +2631,7 @@ static void dump_pixel_entry(const struct pixel_entry *entry)
 
 /* the entry of a draw's pixel shader key (d3d8_gl.c's fragment_shader_get:
 the four met last, then the buckets by hash_words), made the first time */
-static struct pixel_entry *pixel_entry_get(const struct nv2a_pixel_shader_key *key)
+static struct pixel_entry *pixel_entry_get(const struct nv2a_pixel_shader_key *key, int by_constant_alpha)
 {
 	/* consecutive draws mostly use one of a few pixel shaders (an object's
 	parts take turns) */
@@ -2524,14 +2644,15 @@ static struct pixel_entry *pixel_entry_get(const struct nv2a_pixel_shader_key *k
 
 	for (index = 0; index < RECENT_PIXEL_COUNT; index++)
 	{
-		if (recent[index] && words_equal(&recent[index]->key, key, sizeof(*key)))
+		if (recent[index] && recent[index]->by_constant_alpha == by_constant_alpha &&
+			words_equal(&recent[index]->key, key, sizeof(*key)))
 			return recent[index];
 	}
 	hash = hash_words(key, sizeof(*key));
 	bucket = &pixel_buckets[hash % PIXEL_BUCKETS];
 	for (entry = *bucket; entry; entry = entry->next)
 	{
-		if (entry->hash == hash && words_equal(&entry->key, key, sizeof(*key)))
+		if (entry->hash == hash && entry->by_constant_alpha == by_constant_alpha && words_equal(&entry->key, key, sizeof(*key)))
 		{
 			recent[recent_next++ % RECENT_PIXEL_COUNT] = entry;
 			return entry;
@@ -2542,7 +2663,8 @@ static struct pixel_entry *pixel_entry_get(const struct nv2a_pixel_shader_key *k
 		return NULL;
 	entry->hash = hash;
 	entry->key = *key;
-	entry->identity = pixel_identity(key);
+	entry->by_constant_alpha = by_constant_alpha;
+	entry->identity = pixel_identity(key, by_constant_alpha);
 	entry->next = *bucket;
 	*bucket = entry;
 	recent[recent_next++ % RECENT_PIXEL_COUNT] = entry;
@@ -2653,7 +2775,7 @@ static uint32_t pixel_shader_handle(struct pixel_entry *entry)
 	entry->handle = d3d11_backend_shader_find(D3D11_BACKEND_STAGE_PIXEL, entry->identity);
 	if (!entry->handle)
 	{
-		text = nv2a_hlsl_pixel_shader(&entry->key, target);
+		text = nv2a_hlsl_pixel_shader(&entry->key, entry->by_constant_alpha, target);
 		if (text)
 			entry->handle = d3d11_backend_shader_make(D3D11_BACKEND_STAGE_PIXEL, entry->identity, text, strlen(text),
 				HLSL_ENTRY, target);
@@ -2989,12 +3111,60 @@ static uint32_t address_mode(DWORD mode)
 	}
 }
 
-/* apply_raster_state's blending and colour mask */
-static void blend_description(struct d3d11_backend_blend *blend)
+/* a factor that reads the blend constant's colour, or its alpha */
+static BOOL factor_constant_color(DWORD factor)
+{
+	return factor == D3DBLEND_CONSTANTCOLOR || factor == D3DBLEND_INVCONSTANTCOLOR;
+}
+
+static BOOL factor_constant_alpha(DWORD factor)
+{
+	return factor == D3DBLEND_CONSTANTALPHA || factor == D3DBLEND_INVCONSTANTALPHA;
+}
+
+/* the draw blends with the source factor the constant's alpha and the
+destination factor the constant's colour (the transparent meter's blend,
+rasterizer_xbox_transparent_geometry.c, the one such pair in the game): GL
+read the constant's alpha in every channel for the source and the constant's
+colour for the destination, and Direct3D 11 has one blend factor for both,
+so the source's factor goes into the pixel shader (HLSL_BY_CONSTANT_ALPHA,
+or the inverse) and the blend state's source factors are ONE; 0 otherwise */
+static int constant_alpha_mode(void)
+{
+	DWORD *rs = D3D__RenderState;
+
+	if (rs[D3DRS_ALPHABLENDENABLE] && factor_constant_alpha(rs[D3DRS_SRCBLEND]) &&
+		factor_constant_color(rs[D3DRS_DESTBLEND]))
+	{
+		return rs[D3DRS_SRCBLEND] == D3DBLEND_CONSTANTALPHA ? HLSL_BY_CONSTANT_ALPHA : HLSL_BY_INVERSE_CONSTANT_ALPHA;
+	}
+	return HLSL_BY_CONSTANT_ALPHA_NONE;
+}
+
+/* the blend factor OMSetBlendState takes: the constant's colour (its alpha in
+w) where a factor reads the constant's colour; else, where one reads the
+constant's alpha alone, that alpha in every channel, as GL's CONSTANT_ALPHA
+reads it */
+static void blend_factor_values(float factor[4])
+{
+	DWORD *rs = D3D__RenderState;
+
+	color_to_vec4(rs[D3DRS_BLENDCOLOR], factor);
+	if (!factor_constant_color(rs[D3DRS_SRCBLEND]) && !factor_constant_color(rs[D3DRS_DESTBLEND]) &&
+		(factor_constant_alpha(rs[D3DRS_SRCBLEND]) || factor_constant_alpha(rs[D3DRS_DESTBLEND])))
+	{
+		factor[0] = factor[1] = factor[2] = factor[3];
+	}
+}
+
+/* apply_raster_state's blending and colour mask; with by_constant_alpha
+(constant_alpha_mode) the source factors are ONE, the shader having
+multiplied by the constant's alpha */
+static void blend_description(struct d3d11_backend_blend *blend, int by_constant_alpha)
 {
 	DWORD *rs = D3D__RenderState;
 	DWORD write = rs[D3DRS_COLORWRITEENABLE];
-	static BOOL constant_alpha_logged;
+	static BOOL other_way_logged;
 
 	memset(blend, 0, sizeof(*blend));
 	if (rs[D3DRS_ALPHABLENDENABLE])
@@ -3006,14 +3176,17 @@ static void blend_description(struct d3d11_backend_blend *blend)
 		blend->source_alpha = blend_factor(rs[D3DRS_SRCBLEND], TRUE);
 		blend->destination_alpha = blend_factor(rs[D3DRS_DESTBLEND], TRUE);
 		blend->operation_alpha = blend->operation;
-		if (!constant_alpha_logged && (rs[D3DRS_SRCBLEND] == D3DBLEND_CONSTANTALPHA ||
-			rs[D3DRS_SRCBLEND] == D3DBLEND_INVCONSTANTALPHA || rs[D3DRS_DESTBLEND] == D3DBLEND_CONSTANTALPHA ||
-			rs[D3DRS_DESTBLEND] == D3DBLEND_INVCONSTANTALPHA))
+		if (by_constant_alpha)
+			blend->source = blend->source_alpha = D3D11_BACKEND_BLEND_ONE;
+		/* (the other way round, a source constant colour with a destination
+		constant alpha, is not in the game: the factor is the constant's
+		colour, said once) */
+		if (!other_way_logged && factor_constant_color(rs[D3DRS_SRCBLEND]) && factor_constant_alpha(rs[D3DRS_DESTBLEND]))
 		{
-			constant_alpha_logged = TRUE;
-			platform_log("Direct3D 11: a draw blends by the constant's alpha (source %lu, destination %lu): the blend "
-				"factor's colour is to be its alpha when it is bound (logged once)", (unsigned long)rs[D3DRS_SRCBLEND],
-				(unsigned long)rs[D3DRS_DESTBLEND]);
+			other_way_logged = TRUE;
+			platform_log("Direct3D 11: a draw blends with a source constant colour and a destination constant alpha "
+				"(source %lu, destination %lu): both read the constant's colour (logged once)",
+				(unsigned long)rs[D3DRS_SRCBLEND], (unsigned long)rs[D3DRS_DESTBLEND]);
 		}
 	}
 	else
@@ -3171,35 +3344,22 @@ static struct
 	uint32_t sampler_handle[D3DTSS_MAXSTAGES];
 } state_objects;
 
-/* bind_targets' has_depth (d3d8_gl.c), without binding: the targets found
-(and made, as there, the first time) and the depth target kept when it is
-one the backend has */
-static BOOL draw_has_depth(void)
-{
-	struct render_target_entry *depth = render_target_get(device.depth_stencil);
-
-	return depth && depth->target.depth && depth->backend_target;
-}
-
-/* the draw's state objects into device.draw */
-static void draw_states(const struct stage_sampling sampling[D3DTSS_MAXSTAGES])
+/* the draw's state objects into device.draw (has_depth: bind_targets') */
+static void draw_states(const struct stage_sampling sampling[D3DTSS_MAXSTAGES], BOOL has_depth, int by_constant_alpha)
 {
 	struct d3d11_backend_blend blend;
 	struct d3d11_backend_depth_stencil depth_stencil;
 	struct d3d11_backend_rasterizer rasterizer;
 	int stage;
 
-	/* (the colour target found as well, so that bind_targets' entries are
-	made by the draws as d3d8_gl.c makes them) */
-	render_target_get(device.render_target);
-	blend_description(&blend);
+	blend_description(&blend, by_constant_alpha);
 	if (!state_objects.blend_made || !words_equal(&blend, &state_objects.blend, sizeof(blend)))
 	{
 		state_objects.blend = blend;
 		state_objects.blend_handle = d3d11_backend_blend_make(&blend);
 		state_objects.blend_made = TRUE;
 	}
-	depth_stencil_description(&depth_stencil, draw_has_depth());
+	depth_stencil_description(&depth_stencil, has_depth);
 	if (!state_objects.depth_stencil_made || !words_equal(&depth_stencil, &state_objects.depth_stencil,
 		sizeof(depth_stencil)))
 	{
@@ -3242,30 +3402,223 @@ static void draw_states(const struct stage_sampling sampling[D3DTSS_MAXSTAGES])
 	backend_lost_check();
 }
 
-/* ---------- the draw's note */
+/* ---------- the constant buffers (prepare_draw's uniforms, d3d8_gl.c)
 
-/* a draw past draw_ready: its key and its vertex shader's variant, as
-prepare_draw chooses them, their shaders (made now if this run has not made
-them), its layout and its state objects, into device.draw. A lit pair that
+The vertex constants: one DYNAMIC buffer for every program, written whole
+when constants_serial moved since its last write. The model lights: the lit
+pixel shaders' b1, from the same registers (model_light_register), written
+when any of the twelve moved since. The other uniforms: compared as
+draw_uniform_inputs there (the viewport's scale and offset, the texture
+scales, the combiner constants, fog, the alpha reference, UI_OFFSET, the bump
+matrices and luminance; POINTSIZE and MIPMAPLODBIAS out, the HLSL having no
+point size and the bias being the sampler's; BLENDCOLOR in) and, when they
+differ, converted as there into hlsl_shaders.h's two structures, each
+written when its own values changed. */
+
+static unsigned long long constants_written_serial;
+static unsigned long long lights_written_serial;
+static BOOL lights_written;
+
+/* the vertex constant register of each of the per-pixel lighting's
+(XGPU_MODEL_LIGHT_COUNT) */
+static unsigned long model_light_register(int light)
+{
+	return (unsigned long)(XGPU_VERTEX_CONSTANT_BIAS + (light ? -80 + light : -82));
+}
+
+static void constants_update(BOOL lit)
+{
+	if (constants_written_serial != constants_serial)
+	{
+		d3d11_backend_constants_write(D3D11_BACKEND_CONSTANTS_VERTEX, device.constants, sizeof(device.constants));
+		constants_written_serial = constants_serial;
+	}
+	/* the lights of a draw lit for each pixel, from the same registers, when
+	any of them changed since the buffer last had them */
+	if (lit && (!lights_written || lights_written_serial != constants_serial))
+	{
+		int light = 0;
+
+		if (lights_written)
+		{
+			for (light = 0; light < XGPU_MODEL_LIGHT_COUNT; light++)
+			{
+				if (constant_serials[model_light_register(light)] > lights_written_serial)
+					break;
+			}
+		}
+		if (light < XGPU_MODEL_LIGHT_COUNT)
+		{
+			struct hlsl_model_lights lights;
+
+			for (light = 0; light < XGPU_MODEL_LIGHT_COUNT; light++)
+				memcpy(lights.model_lights[light], device.constants[model_light_register(light)], sizeof(lights.model_lights[0]));
+			d3d11_backend_constants_write(D3D11_BACKEND_CONSTANTS_MODEL_LIGHTS, &lights, sizeof(lights));
+			lights_written = TRUE;
+		}
+		lights_written_serial = constants_serial;
+	}
+}
+
+/* the uniforms of the latest draws, converted from these inputs */
+#define DRAW_UNIFORM_INPUT_COUNT (4 + 4 + 16 + 16 + 2 + 4 + 1 + 1 + 1 + 6 * D3DTSS_MAXSTAGES)
+
+static DWORD draw_uniform_inputs[DRAW_UNIFORM_INPUT_COUNT];
+static BOOL draw_uniforms_valid;
+static struct hlsl_vertex_parameters vertex_parameters_written;
+static struct hlsl_pixel_parameters pixel_parameters_written;
+static BOOL vertex_parameters_valid, pixel_parameters_valid;
+
+static float dword_to_float(DWORD value)
+{
+	union { DWORD d; float f; } u;
+
+	u.d = value;
+	return u.f;
+}
+
+static void uniforms_update(const float texture_scale[D3DTSS_MAXSTAGES][4])
+{
+	DWORD inputs[DRAW_UNIFORM_INPUT_COUNT];
+	unsigned long count = 0;
+	struct hlsl_vertex_parameters vertex;
+	struct hlsl_pixel_parameters pixel;
+	int stage;
+
+	/* the state the uniforms come from: most draws share it with the draw
+	before them, and so share its uniforms */
+	memcpy(&inputs[count], device.viewport_scale, sizeof(device.viewport_scale));
+	count += 4;
+	memcpy(&inputs[count], device.viewport_offset, sizeof(device.viewport_offset));
+	count += 4;
+	memcpy(&inputs[count], texture_scale, 16 * sizeof(DWORD));
+	count += 16;
+	for (stage = 0; stage < 8; stage++)
+	{
+		inputs[count++] = D3D__RenderState[D3DRS_PSCONSTANT0_0 + stage];
+		inputs[count++] = D3D__RenderState[D3DRS_PSCONSTANT1_0 + stage];
+	}
+	inputs[count++] = D3D__RenderState[D3DRS_PSFINALCOMBINERCONSTANT0];
+	inputs[count++] = D3D__RenderState[D3DRS_PSFINALCOMBINERCONSTANT1];
+	inputs[count++] = D3D__RenderState[D3DRS_FOGCOLOR];
+	inputs[count++] = D3D__RenderState[D3DRS_FOGSTART];
+	inputs[count++] = D3D__RenderState[D3DRS_FOGEND];
+	inputs[count++] = D3D__RenderState[D3DRS_FOGDENSITY];
+	inputs[count++] = D3D__RenderState[D3DRS_ALPHAREF];
+	inputs[count++] = (DWORD)UI_OFFSET;
+	inputs[count++] = D3D__RenderState[D3DRS_BLENDCOLOR];
+	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
+	{
+		DWORD *state = D3D__TextureState[stage];
+
+		inputs[count++] = state[D3DTSS_BUMPENVMAT00];
+		inputs[count++] = state[D3DTSS_BUMPENVMAT01];
+		inputs[count++] = state[D3DTSS_BUMPENVMAT10];
+		inputs[count++] = state[D3DTSS_BUMPENVMAT11];
+		inputs[count++] = state[D3DTSS_BUMPENVLSCALE];
+		inputs[count++] = state[D3DTSS_BUMPENVLOFFSET];
+	}
+	if (draw_uniforms_valid && words_equal(inputs, draw_uniform_inputs, sizeof(inputs)))
+		return;
+	memcpy(draw_uniform_inputs, inputs, sizeof(inputs));
+	draw_uniforms_valid = TRUE;
+
+	memset(&vertex, 0, sizeof(vertex));
+	memcpy(vertex.viewport_scale, device.viewport_scale, sizeof(vertex.viewport_scale));
+	memcpy(vertex.viewport_offset, device.viewport_offset, sizeof(vertex.viewport_offset));
+	vertex.screen[0] = (float)UI_OFFSET;
+	if (!vertex_parameters_valid || !words_equal(&vertex, &vertex_parameters_written, sizeof(vertex)))
+	{
+		d3d11_backend_constants_write(D3D11_BACKEND_CONSTANTS_VERTEX_PARAMETERS, &vertex, sizeof(vertex));
+		vertex_parameters_written = vertex;
+		vertex_parameters_valid = TRUE;
+	}
+
+	memset(&pixel, 0, sizeof(pixel));
+	for (stage = 0; stage < 8; stage++)
+	{
+		color_to_vec4(D3D__RenderState[D3DRS_PSCONSTANT0_0 + stage], pixel.ps_c0[stage]);
+		color_to_vec4(D3D__RenderState[D3DRS_PSCONSTANT1_0 + stage], pixel.ps_c1[stage]);
+	}
+	color_to_vec4(D3D__RenderState[D3DRS_PSFINALCOMBINERCONSTANT0], pixel.ps_final_c0);
+	color_to_vec4(D3D__RenderState[D3DRS_PSFINALCOMBINERCONSTANT1], pixel.ps_final_c1);
+	color_to_vec4(D3D__RenderState[D3DRS_FOGCOLOR], pixel.fog_color);
+	pixel.fog_parameters[0] = dword_to_float(D3D__RenderState[D3DRS_FOGSTART]);
+	pixel.fog_parameters[1] = dword_to_float(D3D__RenderState[D3DRS_FOGEND]);
+	pixel.fog_parameters[2] = dword_to_float(D3D__RenderState[D3DRS_FOGDENSITY]);
+	pixel.fog_parameters[3] = 0.0f;
+	pixel.alpha_reference[0] = (float)(D3D__RenderState[D3DRS_ALPHAREF] & 0xff);
+	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
+	{
+		DWORD *state = D3D__TextureState[stage];
+
+		pixel.bump_matrix[stage][0] = dword_to_float(state[D3DTSS_BUMPENVMAT00]);
+		pixel.bump_matrix[stage][1] = dword_to_float(state[D3DTSS_BUMPENVMAT01]);
+		pixel.bump_matrix[stage][2] = dword_to_float(state[D3DTSS_BUMPENVMAT10]);
+		pixel.bump_matrix[stage][3] = dword_to_float(state[D3DTSS_BUMPENVMAT11]);
+		pixel.bump_luminance[stage][0] = dword_to_float(state[D3DTSS_BUMPENVLSCALE]);
+		pixel.bump_luminance[stage][1] = dword_to_float(state[D3DTSS_BUMPENVLOFFSET]);
+		pixel.bump_luminance[stage][2] = pixel.bump_luminance[stage][3] = 0.0f;
+		memcpy(pixel.texture_scale[stage], texture_scale[stage], sizeof(pixel.texture_scale[stage]));
+	}
+	color_to_vec4(D3D__RenderState[D3DRS_BLENDCOLOR], pixel.blend_constant);
+	if (!pixel_parameters_valid || !words_equal(&pixel, &pixel_parameters_written, sizeof(pixel)))
+	{
+		d3d11_backend_constants_write(D3D11_BACKEND_CONSTANTS_PIXEL_PARAMETERS, &pixel, sizeof(pixel));
+		pixel_parameters_written = pixel;
+		pixel_parameters_valid = TRUE;
+	}
+}
+
+/* ---------- the draw's preparation (prepare_draw, d3d8_gl.c)
+
+A draw past draw_ready, in prepare_draw's order with the backend's calls
+where the GL was: its key and its textures (the texture cache: step 2), the
+targets after the textures (bind_targets), its vertex shader's variant and
+the two shaders (made now if this run has not made them; a lit pair that
 fails sets lighting_failed and logs prepare_draw's line, and the draw takes
-the unlit variant with the key's per_pixel_lighting 0, as there. FALSE if the
-draw is skipped: a shader that failed, or a layout that could not be made
-(counted). */
-static BOOL draw_note(BOOL immediate)
+the unlit variant with the key's per_pixel_lighting 0, as there), its
+layout, its state objects, the constant buffers, and the record's dynamic
+values and attribute slot. FALSE if the draw is skipped (counted): a stage
+with a texture (until step 2), no target, a shader that failed, a layout
+that could not be made. */
+static BOOL draw_prepare(BOOL immediate)
 {
 	struct vertex_shader_object *program = current_program();
 	struct nv2a_pixel_shader_key key;
 	struct stage_sampling sampling[D3DTSS_MAXSTAGES];
+	float texture_scale[D3DTSS_MAXSTAGES][4];
 	struct vertex_variant *variant = NULL;
 	uint32_t vertex = 0, pixel = 0;
+	BOOL has_depth = FALSE;
+	int by_constant_alpha = constant_alpha_mode();
+	int stage;
 
-	pixel_key_make(&key, sampling);
+	pixel_key_make(&key, sampling, texture_scale);
+	/* (step 1: a draw with a texture is skipped until the texture cache
+	comes, step 2) */
+	for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
+	{
+		if (sampling[stage].sampled)
+		{
+			stats.skipped_textures++;
+			return FALSE;
+		}
+	}
+	/* the targets after the textures: a render target the draw samples has
+	its multisampled pixels resolved first, and the back buffer can be both
+	sampled and drawn into (the backend samples a copy then) */
+	if (!bind_targets(&has_depth))
+	{
+		stats.skipped_no_target++;
+		return FALSE;
+	}
 	if (program->lighting.lights && !program->lighting_failed && per_pixel_lighting())
 	{
 		key.per_pixel_lighting = (unsigned char)program->lighting.lights;
 		variant = vertex_variant_get(program, immediate, TRUE);
 		vertex = vertex_shader_handle(variant);
-		pixel = pixel_shader_handle(pixel_entry_get(&key));
+		pixel = pixel_shader_handle(pixel_entry_get(&key, by_constant_alpha));
 		if (!vertex || !pixel)
 		{
 			/* drawn as the vertex shader lights it instead (not at all,
@@ -3280,7 +3633,7 @@ static BOOL draw_note(BOOL immediate)
 	{
 		variant = vertex_variant_get(program, immediate, FALSE);
 		vertex = vertex_shader_handle(variant);
-		pixel = pixel_shader_handle(pixel_entry_get(&key));
+		pixel = pixel_shader_handle(pixel_entry_get(&key, by_constant_alpha));
 	}
 	if (!vertex || !pixel)
 	{
@@ -3295,8 +3648,140 @@ static BOOL draw_note(BOOL immediate)
 		shaders_met.skipped_no_layout++;
 		return FALSE;
 	}
-	draw_states(sampling);
+	draw_states(sampling, has_depth, by_constant_alpha);
+	constants_update(key.per_pixel_lighting != 0);
+	uniforms_update(texture_scale);
+	/* the dynamic values: the blend factor, the stencil reference, the
+	viewport in the targets' pixels (apply_raster_state's, row 0 at the top:
+	no flip) and its depth range; the scissor is the backend's, the same
+	rectangle */
+	blend_factor_values(device.draw.blend_factor);
+	device.draw.stencil_reference = D3D__RenderState[D3DRS_STENCILREF];
+	device.draw.viewport[0] = target_pixel((float)device.viewport.X, 0);
+	device.draw.viewport[1] = target_pixel((float)device.viewport.Y, 1);
+	device.draw.viewport[2] = target_pixel((float)(device.viewport.X + device.viewport.Width), 0) - device.draw.viewport[0];
+	device.draw.viewport[3] = target_pixel((float)(device.viewport.Y + device.viewport.Height), 1) - device.draw.viewport[1];
+	device.draw.min_depth = device.viewport.MinZ;
+	device.draw.max_depth = device.viewport.MaxZ;
+	/* the attribute slot: the input registers' current values, read by the
+	inputs the layout's elements leave out; a packed register's the integer
+	zero, as GL gave it (setup_streams: state_attribute_value(index, NULL)) */
+	memcpy(device.draw.attributes, device.attributes, sizeof(device.draw.attributes));
+	if (!immediate)
+	{
+		for (stage = 0; stage < XGPU_VERTEX_ATTRIBUTE_COUNT; stage++)
+		{
+			if (device.vertex_shader->packed_mask & (1UL << stage))
+				memset(device.draw.attributes[stage], 0, sizeof(device.draw.attributes[stage]));
+		}
+	}
+	device.draw.query_slot = 0;
 	return TRUE;
+}
+
+/* the record drawn by the backend, where GL drew (glDrawArrays,
+glDrawElementsBaseVertex): counted as a draw when it was, else as not drawn
+(the backend logged why once) */
+static void draw_submit(BOOL immediate)
+{
+	if (d3d11_backend_draw(&device.draw))
+	{
+		if (immediate)
+			stats.immediate_draws++;
+		else
+			stats.draws++;
+	}
+	else
+	{
+		stats.skipped_not_drawn++;
+		backend_lost_check();
+	}
+}
+
+/* ---------- tracing (debug.gpu_trace_frame): d3d8_gl.c's trace_draw */
+
+static void trace_draw(const char *kind, D3DPRIMITIVETYPE type, unsigned long count, const float *first_vertex)
+{
+	struct vertex_shader_object *program = current_program();
+	DWORD *rs = D3D__RenderState;
+
+	if (!trace_frame())
+		return;
+	platform_log("%s type %d count %lu vs %lu (decl %lu) vp %lu,%lu %lux%lu z%.2f-%.2f zen %lu zw %lu zf %lx blend %lu %lx/%lx cull %lx cw %08lx tm %05lx cc %lx fin %08lx/%08lx at %lu/%lx",
+		kind, type, count, program ? program->id : 0, device.vertex_shader ? device.vertex_shader->id : 0,
+		device.viewport.X, device.viewport.Y, device.viewport.Width, device.viewport.Height,
+		device.viewport.MinZ, device.viewport.MaxZ, rs[D3DRS_ZENABLE], rs[D3DRS_ZWRITEENABLE], rs[D3DRS_ZFUNC],
+		rs[D3DRS_ALPHABLENDENABLE], rs[D3DRS_SRCBLEND], rs[D3DRS_DESTBLEND], rs[D3DRS_CULLMODE],
+		rs[D3DRS_COLORWRITEENABLE], rs[D3DRS_PSTEXTUREMODES], rs[D3DRS_PSCOMBINERCOUNT],
+		rs[D3DRS_PSFINALCOMBINERINPUTSABCD], rs[D3DRS_PSFINALCOMBINERINPUTSEFG],
+		rs[D3DRS_ALPHATESTENABLE], rs[D3DRS_ALPHAFUNC]);
+	{
+		int stage;
+
+		for (stage = 0; stage < D3DTSS_MAXSTAGES; stage++)
+		{
+			D3DBaseTexture *texture = device.textures[stage];
+			struct xgpu_texture_description description;
+
+			if (!texture || !((D3D__RenderState[D3DRS_PSTEXTUREMODES] >> (5 * stage)) & 0x1f))
+				continue;
+			xgpu_texture_describe(texture->Format, texture->Size, &description);
+			platform_log("    t%d: data %08lx format %08lx size %08lx -> fmt %02lx %lux%lux%lu levels %lu linear %d cube %d rt %d min %lu mip %lu bias %g maxmip %lu",
+				stage, texture->Data, texture->Format, texture->Size, description.format, description.width,
+				description.height, description.depth, description.levels, description.linear, description.cube_map,
+				render_target_find(texture->Data) != NULL, D3D__TextureState[stage][D3DTSS_MINFILTER],
+				D3D__TextureState[stage][D3DTSS_MIPFILTER], dword_to_float(D3D__TextureState[stage][D3DTSS_MIPMAPLODBIAS]),
+				D3D__TextureState[stage][D3DTSS_MAXMIPLEVEL]);
+		}
+	}
+	platform_log("    offset enable %lu slope %g offset %g zbias %ld stencil %lu func %lx ref %lx mask %lx write %lx ops %lx/%lx/%lx",
+		rs[D3DRS_SOLIDOFFSETENABLE], dword_to_float(rs[D3DRS_POLYGONOFFSETZSLOPESCALE]),
+		dword_to_float(rs[D3DRS_POLYGONOFFSETZOFFSET]), (long)rs[D3DRS_ZBIAS], rs[D3DRS_STENCILENABLE],
+		rs[D3DRS_STENCILFUNC], rs[D3DRS_STENCILREF], rs[D3DRS_STENCILMASK], rs[D3DRS_STENCILWRITEMASK],
+		rs[D3DRS_STENCILFAIL], rs[D3DRS_STENCILZFAIL], rs[D3DRS_STENCILPASS]);
+	if (config_boolean("debug.gpu_trace_constants"))
+	{
+		int constant;
+
+		for (constant = 0; constant < XGPU_VERTEX_CONSTANT_COUNT; constant++)
+		{
+			const float *value = device.constants[constant];
+
+			if (value[0] || value[1] || value[2] || value[3])
+				platform_log("    c[%d] = %g %g %g %g", constant, value[0], value[1], value[2], value[3]);
+		}
+	}
+	if (device.vertex_shader)
+	{
+		unsigned long index;
+
+		for (index = 0; index < device.vertex_shader->element_count; index++)
+		{
+			const struct vertex_element *element = &device.vertex_shader->elements[index];
+
+			platform_log("    decl v%lu: stream %lu offset %lu type %02lx", (unsigned long)element->reg,
+				(unsigned long)element->stream, (unsigned long)element->offset, (unsigned long)element->type);
+		}
+		for (index = 0; index < XGPU_VERTEX_ATTRIBUTE_COUNT; index++)
+		{
+			const float *value = device.attributes[index];
+
+			if (value[0] || value[1] || value[2] || value[3] != 1.0f)
+				platform_log("    current v%lu = %g %g %g %g", index, value[0], value[1], value[2], value[3]);
+		}
+	}
+	if (first_vertex)
+	{
+		int reg;
+
+		for (reg = 0; reg < XGPU_VERTEX_ATTRIBUTE_COUNT; reg++)
+		{
+			const float *v = first_vertex + reg * 4;
+
+			if (v[0] || v[1] || v[2] || v[3] != 1.0f)
+				platform_log("    v%d = %g %g %g %g", reg, v[0], v[1], v[2], v[3]);
+		}
+	}
 }
 
 /* the dump's line, every 600 frames when more came */
@@ -3347,7 +3832,7 @@ static void self_test_pixel(struct self_test *test, const struct nv2a_pixel_shad
 	const char *wanted_target)
 {
 	char target[8];
-	char *text = nv2a_hlsl_pixel_shader(key, target);
+	char *text = nv2a_hlsl_pixel_shader(key, HLSL_BY_CONSTANT_ALPHA_NONE, target);
 	BOOL ok = text && !strcmp(target, wanted_target) &&
 		d3d11_backend_shader_compiles(text, strlen(text), name, HLSL_ENTRY, target);
 
@@ -3715,8 +4200,7 @@ static void shader_service_self_test(char *line, size_t line_size)
 /* prepare_draw's guards (d3d8_gl.c): a draw with no program, no vertex
 shader or no instructions is skipped, as is one debug.gpu_skip_vertex_shaders
 names; and here, a draw with no rings to copy its data into. The rest of
-prepare_draw (the program, the state) is phase 5's; the key and the vertex
-shader's variant are draw_note's. */
+prepare_draw is draw_prepare's. */
 static BOOL draw_ready(void)
 {
 	struct vertex_shader_object *program = current_program();
@@ -3765,20 +4249,24 @@ void WINAPI D3DDevice_SetIndices(D3DIndexBuffer *index_data, UINT base_vertex_in
 
 void WINAPI D3DDevice_DrawVertices(D3DPRIMITIVETYPE primitive_type, UINT start_vertex, UINT vertex_count)
 {
-	if (!vertex_count || !draw_ready() || !draw_note(FALSE))
+	if (!vertex_count || !draw_ready() || !draw_prepare(FALSE))
 		return;
+	trace_draw("draw", primitive_type, vertex_count, NULL);
 	stream_data(start_vertex, vertex_count);
-	if (primitive_type == D3DPT_QUADLIST)
+	device.draw.topology = primitive_topology(primitive_type);
+	if (primitive_made(primitive_type))
 	{
 		unsigned long count;
-		WORD *indices = quad_indices(NULL, vertex_count, &count);
+		WORD *indices = made_indices(primitive_type, NULL, vertex_count, &count);
 
-		/* (glDrawElements from the indices at this offset: phase 6) */
-		index_upload(indices, count * sizeof(WORD));
+		draw_indices_at(D3D11_BACKEND_DATA_RING, 0, index_upload(indices, count * sizeof(WORD)), count, 0);
 		free(indices);
 	}
-	/* (else glDrawArrays: phase 6) */
-	stats.draws++;
+	else
+	{
+		draw_indices_none(vertex_count);
+	}
+	draw_submit(FALSE);
 }
 
 void WINAPI D3DDevice_DrawIndexedVertices(D3DPRIMITIVETYPE primitive_type, UINT vertex_count, CONST WORD *index_data)
@@ -3789,33 +4277,34 @@ void WINAPI D3DDevice_DrawIndexedVertices(D3DPRIMITIVETYPE primitive_type, UINT 
 	uint32_t index_segment = 0;
 	BOOL mirrored;
 
-	if (!vertex_count || !index_data || !draw_ready() || !draw_note(FALSE))
+	if (!vertex_count || !index_data || !draw_ready() || !draw_prepare(FALSE))
 		return;
-	/* quads are drawn as triangles, from indices made for the draw */
-	mirrored = primitive_type != D3DPT_QUADLIST &&
+	/* quads, fans, polygons and loops are drawn from indices made for the
+	draw */
+	mirrored = !primitive_made(primitive_type) &&
 		mirror_range((unsigned long)index_data, vertex_count * sizeof(WORD), &index_segment, &index_offset, &generation);
 	index_extent(index_data, vertex_count, generation, mirrored, &minimum, &maximum);
+	trace_draw("indexed", primitive_type, vertex_count, NULL);
 	/* (the streams from the base vertex on: index i is vertex base + i) */
 	stream_data(device.base_vertex_index + minimum, maximum - minimum + 1);
+	device.draw.topology = primitive_topology(primitive_type);
 	if (mirrored)
 	{
-		/* (glDrawElementsBaseVertex from the segment's indices at
-		index_offset, the attributes starting at vertex minimum: phase 6) */
-		(void)index_segment;
-		stats.draws++;
+		/* the attributes start at vertex minimum */
+		draw_indices_at(D3D11_BACKEND_DATA_SEGMENT, index_segment, index_offset, vertex_count, -(long)minimum);
+		draw_submit(FALSE);
 		return;
 	}
 	stats.streamed_bytes += vertex_count * sizeof(WORD);
 	count = vertex_count;
-	if (primitive_type == D3DPT_QUADLIST)
+	if (primitive_made(primitive_type))
 	{
-		indices = quad_indices(index_data, vertex_count, &count);
+		indices = made_indices(primitive_type, index_data, vertex_count, &count);
 		source = indices;
 	}
-	/* (glDrawElementsBaseVertex from the indices at this offset: phase 6) */
-	index_upload(source, count * sizeof(WORD));
+	draw_indices_at(D3D11_BACKEND_DATA_RING, 0, index_upload(source, count * sizeof(WORD)), count, -(long)minimum);
 	free(indices);
-	stats.draws++;
+	draw_submit(FALSE);
 }
 
 /* ---------- immediate mode */
@@ -3844,28 +4333,34 @@ static void immediate_emit(void)
 void WINAPI D3DDevice_End(void)
 {
 	unsigned long stride = XGPU_VERTEX_ATTRIBUTE_COUNT * 4 * sizeof(float);
-	unsigned long count = device.immediate_count;
+	unsigned long offset, count = device.immediate_count;
 	D3DPRIMITIVETYPE type = device.immediate_type;
 
 	device.immediate_active = FALSE;
-	if (!count || !draw_ready() || !draw_note(TRUE))
+	if (!count || !draw_ready() || !draw_prepare(TRUE))
 		return;
-	/* (the vertices streamed; every attribute four floats, one after
-	another: the immediate vertex array, layout_attribute, vertex_array_get,
-	and the ring bound at the offset this returns, state_vertex_buffer, are
-	phase 6's) */
-	stream_upload(device.immediate_vertices, count * stride);
-	if (type == D3DPT_QUADLIST)
+	trace_draw("immediate", type, count, device.immediate_vertices);
+	/* the vertices streamed: every attribute four floats, one after another,
+	in slot 0 at the ring's offset (the variant's immediate layout) */
+	offset = stream_upload(device.immediate_vertices, count * stride);
+	memset(device.draw.streams, 0, sizeof(device.draw.streams));
+	device.draw.streams[0].kind = D3D11_BACKEND_DATA_RING;
+	device.draw.streams[0].offset = (uint32_t)offset;
+	device.draw.streams[0].stride = (uint32_t)stride;
+	device.draw.topology = primitive_topology(type);
+	if (primitive_made(type))
 	{
 		unsigned long index_count;
-		WORD *indices = quad_indices(NULL, count, &index_count);
+		WORD *indices = made_indices(type, NULL, count, &index_count);
 
-		/* (glDrawElements from the indices at this offset: phase 6) */
-		index_upload(indices, index_count * sizeof(WORD));
+		draw_indices_at(D3D11_BACKEND_DATA_RING, 0, index_upload(indices, index_count * sizeof(WORD)), index_count, 0);
 		free(indices);
 	}
-	/* (else glDrawArrays: phase 6) */
-	stats.immediate_draws++;
+	else
+	{
+		draw_indices_none(count);
+	}
+	draw_submit(TRUE);
 }
 
 static void set_attribute(INT reg, float a, float b, float c, float d)
@@ -4145,11 +4640,12 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		the layer) */
 		char layer[64] = "";
 		uint32_t resizes = d3d11_backend_resizes(), discards = d3d11_backend_ring_discards();
-		uint32_t made[D3D11_BACKEND_STATISTICS];
+		uint32_t made[D3D11_BACKEND_STATISTICS], drawn[D3D11_BACKEND_DRAW_STATISTICS];
 		int index;
 
 		if (config_boolean("debug.d3d11_debug"))
 			snprintf(layer, sizeof(layer), "; %lu debug layer messages", stats.debug_messages);
+		d3d11_backend_draw_statistics(drawn);
 		/* (the shader service's totals since the self-tests: shaders read
 		from the cache and compiled, with the time each took, failed; layouts,
 		those with an input the shader reads from the attribute slot; state
@@ -4170,23 +4666,30 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 			(unsigned long)made[D3D11_BACKEND_STATISTIC_DEPTH_STENCIL],
 			(unsigned long)made[D3D11_BACKEND_STATISTIC_RASTERIZER], (unsigned long)made[D3D11_BACKEND_STATISTIC_SAMPLERS],
 			shaders_met.skipped_no_shader, shaders_met.skipped_no_layout);
-		platform_log("frame %lu: Direct3D 11 clears only; %lu draws, %lu immediate dropped; skipped in 60 frames: %lu no "
-			"program, %lu no buffer; %lu clears (%lu by clear calls, %lu drawn), %lu target changes, %lu targets; %lu KB "
-			"mirrored, %lu KB streamed, %lu KB uploaded to %lu segments, %lu ring discards; %lu pixel keys, %lu vertex "
-			"variants met; %lu presented, %lu not; "
-			"%lu swap chain resizes; %lu GL stub calls%s",
+		platform_log("frame %lu: Direct3D 11; %lu draws, %lu immediate; skipped in 60 frames: %lu no "
+			"program, %lu no buffer, %lu no target, %lu textures, %lu not drawn; %lu clears (%lu by clear calls, %lu drawn), "
+			"%lu target changes, %lu targets; %lu KB mirrored, %lu KB streamed, %lu KB uploaded to %lu segments, %lu ring "
+			"discards; %lu binds skipped, %lu self-sampling copies; %lu pixel keys, %lu vertex variants met; %lu presented, "
+			"%lu not; %lu swap chain resizes; %lu GL stub calls%s",
 			device.frame, stats.draws / stats.presents, stats.immediate_draws / stats.presents,
-			stats.skipped_no_program, stats.skipped_no_buffer,
+			stats.skipped_no_program, stats.skipped_no_buffer, stats.skipped_no_target, stats.skipped_textures,
+			stats.skipped_not_drawn,
 			stats.clears / stats.presents, stats.clears_by_calls / stats.presents, stats.clears_drawn / stats.presents,
 			stats.target_changes / stats.presents, (unsigned long)d3d11_backend_targets_alive(),
 			stats.mirrored_bytes / stats.presents / 1024, stats.streamed_bytes / stats.presents / 1024,
 			stats.uploaded_bytes / stats.presents / 1024, (unsigned long)d3d11_backend_segments_alive(),
-			(unsigned long)(discards - device.discards_before), shaders_met.pixel_keys, shaders_met.vertex_variants,
+			(unsigned long)(discards - device.discards_before),
+			(unsigned long)(drawn[D3D11_BACKEND_DRAW_STATISTIC_BINDS_SKIPPED] -
+				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_BINDS_SKIPPED]),
+			(unsigned long)(drawn[D3D11_BACKEND_DRAW_STATISTIC_SELF_SAMPLING_COPIES] -
+				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_SELF_SAMPLING_COPIES]),
+			shaders_met.pixel_keys, shaders_met.vertex_variants,
 			stats.presented,
 			stats.not_presented, (unsigned long)(resizes - device.resizes_before),
 			gl_stubs_calls() - device.gl_stub_calls_before, layer);
 		device.resizes_before = resizes;
 		device.discards_before = discards;
+		memcpy(device.draw_statistics_before, drawn, sizeof(drawn));
 		memset(&stats, 0, sizeof(stats));
 	}
 	dump_say();

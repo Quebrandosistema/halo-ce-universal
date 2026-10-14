@@ -227,6 +227,16 @@ uint32_t d3d11_backend_ring_discards(void)
 	return M.discards;
 }
 
+ID3D11Buffer *d3d11_backend_ring_buffer(uint32_t ring)
+{
+	return M.ready && ring < 2 ? M.rings[ring].buffer : NULL;
+}
+
+ID3D11Buffer *d3d11_backend_segment_buffer(uint32_t segment)
+{
+	return M.ready && segment && segment <= M.segment_count ? M.segments[segment - 1] : NULL;
+}
+
 /* ---------- the segments */
 
 static ID3D11Buffer *segment_make(uint32_t size)
@@ -637,6 +647,7 @@ int d3d11_backend_memory_self_test(char *line, size_t line_size)
 	ID3D11DeviceContext_PSSetShader(B.context, NULL, NULL, 0);
 	ID3D11DeviceContext_OMSetRenderTargets(B.context, 0, NULL, NULL);
 	d3d11_backend_targets_forget();
+	d3d11_backend_state_forget();
 	M.discards = discards;
 	release(&segment);
 	target_free(&targets[1]);

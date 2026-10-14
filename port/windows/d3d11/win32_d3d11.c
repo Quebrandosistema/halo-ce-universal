@@ -31,6 +31,11 @@ service's unit (win32_d3d11_shaders.c), which the built-in shaders compile
 through, outside its cache; destroy releases the service's objects after the
 memory unit's.
 
+Phase 6: the targets bound only when the pair changes, a stage sampling the
+colour target unbound first; the draws' shadow (win32_d3d11_draw.c) told
+when the clears draw; destroy releases the draw unit's and the textures
+unit's objects after the service's.
+
 hr_text, drain_debug (as backend_drain_debug), choose_adapter and
 create_device are copied from phase 0's probe (win32_d3d11_probe.c), where they
 were tried on this machine's Adreno and on WARP, and changed only for what the
@@ -432,6 +437,8 @@ void d3d11_backend_destroy(void)
 	d3d11_backend_present_release();
 	d3d11_backend_memory_release();
 	d3d11_backend_shaders_release();
+	d3d11_backend_draw_release();
+	d3d11_backend_textures_release();
 	resources_release();
 	ID3D11DeviceContext_Flush(B.context);
 	release(&B.context);
@@ -652,8 +659,11 @@ own, made and released by it. */
 static struct target *targets;
 static uint32_t target_count, target_capacity;
 
-/* what is bound (d3d11_backend_targets_set), for the clears */
+/* what is bound (d3d11_backend_targets_set), for the clears and the draws;
+bound_valid says the context holds them (the present and the self-tests
+bind others in their place) */
 static struct target *bound_color, *bound_depth;
+static int bound_valid;
 
 /* the read-back's staging texture, kept while the size is the same */
 static ID3D11Texture2D *staging;
@@ -755,6 +765,21 @@ uint32_t d3d11_backend_targets_alive(void)
 	return target_count;
 }
 
+struct target *d3d11_backend_bound_color(void)
+{
+	return bound_color;
+}
+
+struct target *d3d11_backend_bound_depth(void)
+{
+	return bound_depth;
+}
+
+struct target *d3d11_backend_target_at(uint32_t handle)
+{
+	return target_from_handle(handle);
+}
+
 ID3D11ShaderResourceView *d3d11_backend_target_view(uint32_t handle, uint32_t *width, uint32_t *height)
 {
 	struct target *target = target_from_handle(handle);
@@ -767,8 +792,10 @@ ID3D11ShaderResourceView *d3d11_backend_target_view(uint32_t handle, uint32_t *w
 }
 
 /* the views bound, and the viewport over the whole colour target (or the
-depth one). Direct3D 11 binds a depth target with a colour target only of
-the same size: one of another size is left out, logged once. */
+depth one), unless the pair is the one bound already. Direct3D 11 binds a
+depth target with a colour target only of the same size: one of another
+size is left out, logged once. A stage still sampling the colour target is
+unbound first (a resource is not a target and a texture at once). */
 static void targets_bind(struct target *color, struct target *depth)
 {
 	ID3D11RenderTargetView *views[1];
@@ -788,10 +815,16 @@ static void targets_bind(struct target *color, struct target *depth)
 		}
 		depth = NULL;
 	}
+	if (bound_valid && bound_color == color && bound_depth == depth)
+		return;
 	bound_color = color;
 	bound_depth = depth;
+	bound_valid = 1;
+	if (color)
+		d3d11_backend_draw_target_unbind(color->view);
 	views[0] = color ? color->color : NULL;
 	ID3D11DeviceContext_OMSetRenderTargets(B.context, 1, views, depth ? depth->depth : NULL);
+	d3d11_backend_draw_viewport_forget();
 	whole = color ? color : depth;
 	if (whole)
 	{
@@ -819,6 +852,7 @@ void d3d11_backend_targets_forget(void)
 {
 	bound_color = NULL;
 	bound_depth = NULL;
+	bound_valid = 0;
 }
 
 /* ---------- clears */
@@ -853,6 +887,8 @@ int d3d11_backend_draw_clear(uint32_t channels, const float color[4], float z, u
 	ID3D11DeviceContext_RSSetState(B.context, d3d11_backend_scissored);
 	ID3D11DeviceContext_RSSetScissorRects(B.context, 1, rectangle);
 	ID3D11DeviceContext_Draw(B.context, 3, 0);
+	/* (the draws' shadow no longer holds) */
+	d3d11_backend_state_forget();
 	return 1;
 }
 

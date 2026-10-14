@@ -283,8 +283,10 @@ int d3d11_backend_present(uint32_t back_buffer, uint32_t window_width, uint32_t 
 		ID3D11DeviceContext_RSSetState(B.context, d3d11_backend_scissored);
 		ID3D11DeviceContext_RSSetScissorRects(B.context, 1, &rectangle);
 		ID3D11DeviceContext_Draw(B.context, 3, 0);
-		/* (the back buffer is a target again at the next clear) */
+		/* (the back buffer is a target again at the next clear; the draws'
+		shadow no longer holds) */
 		ID3D11DeviceContext_PSSetShaderResources(B.context, 0, 1, &none);
+		d3d11_backend_state_forget();
 
 		/* 4. the marker, over the picture: red at its top left, green at its
 		top right, through the clears' drawn path */

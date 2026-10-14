@@ -9,7 +9,8 @@ change it) in which only what is GLSL's grammar is HLSL's: the prologue (the
 constant buffers, the interface's structure and statics from
 hlsl_shaders.h), the types, constructors and functions, the textures and
 their samplers, the multisampled alpha test's coverage (SV_Coverage, at
-ps_4_1) and the colour returned. The texture stages, the combiners, fog,
+ps_4_1), the colour returned and (phase 6) the multiply by the blend
+constant's alpha for the draw that blends by it. The texture stages, the combiners, fog,
 the alpha test, alpha kill, colour sign, coverage_alpha, the per-pixel
 lighting and the debug.gpu_debug_* settings are the original's, line for
 line; the Android branches (the LOD bias uniform, the atomic counter) do not
@@ -577,7 +578,7 @@ static void model_lighting(struct xgpu_text *text, BOOL point_lights)
 	xgpu_text_append(text, "\treturn clamp(light, 0.0, 1.0);\n}\n");
 }
 
-char *nv2a_hlsl_pixel_shader(const struct nv2a_pixel_shader_key *key, char target[8])
+char *nv2a_hlsl_pixel_shader(const struct nv2a_pixel_shader_key *key, int by_constant_alpha, char target[8])
 {
 	const DWORD *state = key->combiner_state;
 	struct xgpu_text text = { 0 };
@@ -737,6 +738,15 @@ char *nv2a_hlsl_pixel_shader(const struct nv2a_pixel_shader_key *key, char targe
 		xgpu_text_append(&text, "\tresult = float4(t0.rgb, 1.0);\n");
 	if (config_boolean("debug.gpu_debug_flat"))
 		xgpu_text_append(&text, "\tresult = xD0.a > 0.0 ? float4(xD0.rgb, 1.0) : float4(1.0, 0.0, 1.0, 1.0);\n");
+	/* the source blend factor the constant's alpha (with the destination's
+	the constant's colour: the transparent meter), taken into the colour, all
+	four channels, after the alpha test (which reads the shader's alpha) and
+	before the return (blending reads the product); the blend state's source
+	factors are ONE (d3d8_d3d11.c) */
+	if (by_constant_alpha == HLSL_BY_CONSTANT_ALPHA)
+		xgpu_text_append(&text, "\tresult *= blend_constant.w;\n");
+	else if (by_constant_alpha == HLSL_BY_INVERSE_CONSTANT_ALPHA)
+		xgpu_text_append(&text, "\tresult *= 1.0 - blend_constant.w;\n");
 	if (coverage)
 		xgpu_text_append(&text, "\toutput.color = clamp(result, 0.0, 1.0);\n\treturn output;\n}\n");
 	else

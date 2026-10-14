@@ -1220,6 +1220,45 @@ uint32_t d3d11_backend_sampler_make(const struct d3d11_backend_sampler *in)
 	return handle;
 }
 
+/* ---------- the objects by handle, for the draw */
+
+IUnknown *d3d11_backend_shader_object(uint32_t stage, uint32_t handle)
+{
+	if (!handle || handle > C.shader_count || C.shaders[handle - 1].stage != stage)
+		return NULL;
+	return C.shaders[handle - 1].object;
+}
+
+static IUnknown *object_at(const struct objects *objects, uint32_t handle)
+{
+	return handle && handle <= objects->count ? objects->items[handle - 1] : NULL;
+}
+
+ID3D11InputLayout *d3d11_backend_layout_object(uint32_t handle)
+{
+	return (ID3D11InputLayout *)object_at(&C.layouts, handle);
+}
+
+ID3D11BlendState *d3d11_backend_blend_object(uint32_t handle)
+{
+	return (ID3D11BlendState *)object_at(&C.blends, handle);
+}
+
+ID3D11DepthStencilState *d3d11_backend_depth_stencil_object(uint32_t handle)
+{
+	return (ID3D11DepthStencilState *)object_at(&C.depth_stencils, handle);
+}
+
+ID3D11RasterizerState *d3d11_backend_rasterizer_object(uint32_t handle)
+{
+	return (ID3D11RasterizerState *)object_at(&C.rasterizers, handle);
+}
+
+ID3D11SamplerState *d3d11_backend_sampler_object(uint32_t handle)
+{
+	return (ID3D11SamplerState *)object_at(&C.samplers, handle);
+}
+
 /* ---------- the statistics, the release */
 
 void d3d11_backend_shaders_statistics(uint32_t counts[D3D11_BACKEND_STATISTICS])

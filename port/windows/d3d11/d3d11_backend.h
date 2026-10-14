@@ -4,18 +4,20 @@ D3D11_BACKEND.H
 The boundary between the Direct3D 11 renderer's two halves
 (port/windows/D3D11.md, "Where the renderer lives"): the Direct3D 8 device
 the game drives (d3d8_d3d11.c, compiled against the Xbox SDK's headers) and
-the Direct3D 11 backend (win32_d3d11.c, win32_d3d11_present.c and
-win32_d3d11_memory.c and win32_d3d11_shaders.c, against the Windows SDK's). The two SDKs define the same names
-differently, so no unit
-sees both: this header includes neither, and only fixed-width integers, int,
-strings and plain pointers cross it, as in update.h and posix.h.
+the Direct3D 11 backend (win32_d3d11.c, win32_d3d11_present.c,
+win32_d3d11_memory.c, win32_d3d11_shaders.c and win32_d3d11_draw.c, against
+the Windows SDK's). The two SDKs define the same names differently, so no
+unit sees both: this header includes neither, and only fixed-width integers,
+int, strings and plain pointers cross it, as in update.h and posix.h.
 
 Phase 1: the device, the adapter, the debug layer, the log line. Phase 2: the
 swap chain and the present, the render targets, the clears, the read-back,
 the clears' self-test, the lost device. Phase 3: the stream and index rings,
 the mirror's segments and their upload ring, the memory self-test. Phase 4:
 a shader's compile, for the generator self-test. Phase 5: the shader service
-with its cache on the disk, the input layouts and the state objects.
+with its cache on the disk, the input layouts and the state objects. Phase
+6: the draw's record, the constant buffers, the textures, the composites,
+the multisampling and the resolves, the anti-aliasing passes, the queries.
 */
 
 #ifndef D3D11_BACKEND_H
@@ -364,5 +366,124 @@ again; a layout over the test's vertex shader with an input left out; one
 state object of each kind found again by its description. 1 if each did as
 it should; line says so, or which case did not. */
 int d3d11_backend_shaders_self_test(char *line, size_t line_size);
+
+/* ---------- the draw (win32_d3d11_draw.c)
+
+One self-contained record a draw, in fixed-width fields the backend copies
+during the call; the backend keeps what it last bound and sets only what
+differs (d3d8_gl.c's gl_state, kept on this side of the boundary: the device
+does not know what is bound). The constant buffers do not travel in the
+record: the device writes them (d3d11_backend_constants_write) when its
+serials say they changed, and the backend binds the same four at every
+draw. */
+
+/* where a vertex stream's or the indices' bytes are */
+#define D3D11_BACKEND_DATA_NONE 0u
+#define D3D11_BACKEND_DATA_RING 1u
+#define D3D11_BACKEND_DATA_SEGMENT 2u
+
+/* what a stage samples */
+#define D3D11_BACKEND_TEXTURE_NONE 0u
+#define D3D11_BACKEND_TEXTURE_CACHE 1u
+#define D3D11_BACKEND_TEXTURE_TARGET 2u
+#define D3D11_BACKEND_TEXTURE_COMPOSITE 3u
+
+/* the topologies (D3D11_PRIMITIVE_TOPOLOGY's numbers, checked by the
+backend): Direct3D 11 has no fan, no loop and no quads, which the device
+draws as indexed triangles and strips */
+#define D3D11_BACKEND_TOPOLOGY_POINTLIST 1u
+#define D3D11_BACKEND_TOPOLOGY_LINELIST 2u
+#define D3D11_BACKEND_TOPOLOGY_LINESTRIP 3u
+#define D3D11_BACKEND_TOPOLOGY_TRIANGLELIST 4u
+#define D3D11_BACKEND_TOPOLOGY_TRIANGLESTRIP 5u
+
+#define D3D11_BACKEND_STREAM_COUNT 16u
+#define D3D11_BACKEND_STAGE_COUNT 4u
+
+struct d3d11_backend_draw_stream
+{
+	/* D3D11_BACKEND_DATA_*; the segment's handle for a segment; the byte
+	offset in the ring or the segment; the vertex stride */
+	uint32_t kind, segment, offset, stride;
+};
+
+struct d3d11_backend_draw_texture
+{
+	/* D3D11_BACKEND_TEXTURE_*; the cache's, the target's or the composite's
+	handle */
+	uint32_t kind, handle;
+};
+
+struct d3d11_backend_draw
+{
+	/* the objects (the shader service's handles) */
+	uint32_t vertex_shader, pixel_shader, layout;
+	uint32_t blend, depth_stencil, rasterizer;
+	uint32_t samplers[D3D11_BACKEND_STAGE_COUNT];
+	/* the dynamic values: D3DRS_BLENDCOLOR's channels, D3DRS_STENCILREF, the
+	viewport (x, y, width, height in the targets' pixels, row 0 at the top;
+	the scissor is the same rectangle; nothing is drawn when the width or
+	height is 0) and its depth range */
+	float blend_factor[4];
+	uint32_t stencil_reference;
+	int32_t viewport[4];
+	float min_depth, max_depth;
+	/* the vertex input: each slot's bytes, and the sixteen current values
+	of the input registers (D3DDevice_SetVertexData), read by the inputs the
+	layout's elements leave out (D3D11_BACKEND_ATTRIBUTE_SLOT) */
+	struct d3d11_backend_draw_stream streams[D3D11_BACKEND_STREAM_COUNT];
+	float attributes[16][4];
+	/* the indices (D3D11_BACKEND_DATA_NONE: a plain draw of vertex_count
+	vertices), the byte offset of the first, how many, and the vertex each
+	index counts from */
+	uint32_t index_kind, index_segment, index_offset, index_count;
+	int32_t base_vertex;
+	uint32_t vertex_count;
+	uint32_t topology;
+	/* what each stage samples (none: no view bound, which Direct3D 11 reads
+	as zero) */
+	struct d3d11_backend_draw_texture textures[D3D11_BACKEND_STAGE_COUNT];
+	/* the visibility test the draw is inside, 0 for none (phase 6, step 6) */
+	uint32_t query_slot;
+};
+
+/* the record bound (what differs from the last) and drawn: 1 drawn; 0 and
+nothing bound when no target is bound, an object's handle names nothing, or
+the device is lost */
+int d3d11_backend_draw(const struct d3d11_backend_draw *draw);
+
+/* the constant buffers: the vertex constants (hlsl_shaders.h's
+vertex_constants, b0 of the vertex stage), the vertex parameters (b1), the
+pixel parameters (b0 of the pixel stage) and the model lights (b1), each a
+DYNAMIC buffer of the header's size, written whole with Map DISCARD (the
+bytes copied during the call) */
+#define D3D11_BACKEND_CONSTANTS_VERTEX 0u
+#define D3D11_BACKEND_CONSTANTS_VERTEX_PARAMETERS 1u
+#define D3D11_BACKEND_CONSTANTS_PIXEL_PARAMETERS 2u
+#define D3D11_BACKEND_CONSTANTS_MODEL_LIGHTS 3u
+void d3d11_backend_constants_write(uint32_t which, const void *data, uint32_t size);
+
+/* what the backend keeps of the last draw's binds is forgotten: the next
+draw sets everything (the backend calls it itself after the clears, the
+present, the passes and the self-tests, which bind behind the draws) */
+void d3d11_backend_state_forget(void);
+
+/* what d3d11_backend_draw_statistics fills, totals since the start: the
+draws made; the binds the shadow skipped; the copies of a target sampled
+while it is drawn into; the textures' writes and their bytes; the textures
+alive and their bytes; the targets resolved; the composites' level copies;
+the queries begun */
+#define D3D11_BACKEND_DRAW_STATISTIC_DRAWS 0
+#define D3D11_BACKEND_DRAW_STATISTIC_BINDS_SKIPPED 1
+#define D3D11_BACKEND_DRAW_STATISTIC_SELF_SAMPLING_COPIES 2
+#define D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_WRITES 3
+#define D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_WRITE_BYTES 4
+#define D3D11_BACKEND_DRAW_STATISTIC_TEXTURES_ALIVE 5
+#define D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_BYTES 6
+#define D3D11_BACKEND_DRAW_STATISTIC_RESOLVES 7
+#define D3D11_BACKEND_DRAW_STATISTIC_COMPOSITE_COPIES 8
+#define D3D11_BACKEND_DRAW_STATISTIC_QUERIES 9
+#define D3D11_BACKEND_DRAW_STATISTICS 10
+void d3d11_backend_draw_statistics(uint32_t counts[D3D11_BACKEND_DRAW_STATISTICS]);
 
 #endif

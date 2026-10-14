@@ -4,11 +4,12 @@ WIN32_D3D11.H
 What the Direct3D 11 backend's own units share (port/windows/D3D11.md):
 win32_d3d11.c (the device, the targets, the clears, the built-in shaders),
 win32_d3d11_present.c (the swap chain and the present), win32_d3d11_memory.c
-(the rings, the segments, the upload ring) and win32_d3d11_shaders.c (the
-compiler, the shader service and its cache, the layouts, the state objects).
-Windows SDK's types:
-only the Windows-facing units include it; the device (d3d8_d3d11.c) sees
-d3d11_backend.h alone.
+(the rings, the segments, the upload ring), win32_d3d11_shaders.c (the
+compiler, the shader service and its cache, the layouts, the state objects),
+win32_d3d11_draw.c (the draw: the record bound and drawn, the constant
+buffers, the self-sampling copies) and win32_d3d11_textures.c (the textures
+and their views). Windows SDK's types: only the Windows-facing units include
+it; the device (d3d8_d3d11.c) sees d3d11_backend.h alone.
 */
 
 #ifndef WIN32_D3D11_H
@@ -85,6 +86,12 @@ int d3d11_backend_draw_clear(uint32_t channels, const float color[4], float z, u
 (the present binds the swap chain's view in their place) */
 void d3d11_backend_targets_forget(void);
 
+/* the targets bound (NULL for none), and a target by its handle (NULL for
+none) */
+struct target *d3d11_backend_bound_color(void);
+struct target *d3d11_backend_bound_depth(void);
+struct target *d3d11_backend_target_at(uint32_t handle);
+
 /* the present's objects released (d3d11_backend_destroy, before the rest) */
 void d3d11_backend_present_release(void);
 
@@ -139,5 +146,35 @@ void d3d11_backend_memory_release(void);
 /* the shader service's shaders, layouts and state objects released
 (d3d11_backend_destroy, after the memory unit's) */
 void d3d11_backend_shaders_release(void);
+
+/* the service's objects by handle, for the draw (NULL for 0 or a handle
+that names nothing) */
+IUnknown *d3d11_backend_shader_object(uint32_t stage, uint32_t handle);
+ID3D11InputLayout *d3d11_backend_layout_object(uint32_t handle);
+ID3D11BlendState *d3d11_backend_blend_object(uint32_t handle);
+ID3D11DepthStencilState *d3d11_backend_depth_stencil_object(uint32_t handle);
+ID3D11RasterizerState *d3d11_backend_rasterizer_object(uint32_t handle);
+ID3D11SamplerState *d3d11_backend_sampler_object(uint32_t handle);
+
+/* the memory unit's buffers by handle, for the draw (NULL for none) */
+ID3D11Buffer *d3d11_backend_ring_buffer(uint32_t ring);
+ID3D11Buffer *d3d11_backend_segment_buffer(uint32_t segment);
+
+/* the draw unit (win32_d3d11_draw.c): the viewport's shadow forgotten when
+the targets are bound (which sets the whole target's viewport); a target
+about to be bound unbound from the stages that sample it; its objects
+released (d3d11_backend_destroy, after the shader service's) */
+void d3d11_backend_draw_viewport_forget(void);
+void d3d11_backend_draw_target_unbind(ID3D11ShaderResourceView *view);
+void d3d11_backend_draw_release(void);
+
+/* the textures unit (win32_d3d11_textures.c): a texture's or a composite's
+view by handle (NULL for none); its counts into the draw statistics
+(textures alive and their bytes, writes and their bytes, composite copies);
+its objects released */
+ID3D11ShaderResourceView *d3d11_backend_texture_view(uint32_t handle);
+ID3D11ShaderResourceView *d3d11_backend_composite_view(uint32_t handle);
+void d3d11_backend_textures_statistics(uint32_t counts[D3D11_BACKEND_DRAW_STATISTICS]);
+void d3d11_backend_textures_release(void);
 
 #endif
