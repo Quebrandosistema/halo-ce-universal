@@ -493,6 +493,9 @@ int d3d11_backend_draw(const struct d3d11_backend_draw *draw)
 	return 1;
 }
 
+/* the visibility tests begun (below) */
+static uint32_t queries_begun(void);
+
 void d3d11_backend_draw_statistics(uint32_t counts[D3D11_BACKEND_DRAW_STATISTICS])
 {
 	memset(counts, 0, D3D11_BACKEND_DRAW_STATISTICS * sizeof(counts[0]));
@@ -500,12 +503,171 @@ void d3d11_backend_draw_statistics(uint32_t counts[D3D11_BACKEND_DRAW_STATISTICS
 	counts[D3D11_BACKEND_DRAW_STATISTIC_BINDS_SKIPPED] = D.binds_skipped;
 	counts[D3D11_BACKEND_DRAW_STATISTIC_SELF_SAMPLING_COPIES] = D.self_sampling_copies;
 	counts[D3D11_BACKEND_DRAW_STATISTIC_RESOLVES] = d3d11_backend_target_resolves();
+	counts[D3D11_BACKEND_DRAW_STATISTIC_QUERIES] = queries_begun();
 	d3d11_backend_textures_statistics(counts);
+}
+
+/* ---------- visibility tests (step 6)
+
+D3D11_QUERY_OCCLUSION (a 64-bit count of the samples that passed, exact at
+feature level 11_0) in the game's slots, as d3d8_gl.c's desktop path keeps
+its GL queries: a test begins on a scratch query, and at its end the
+scratch is put in the slot. A query spans target changes (Direct3D 11 has no
+render pass). Results are asked for with D3D11_ASYNC_GETDATA_DONOTFLUSH and
+never waited for: the device keeps the latest count known.
+
+The slot's earlier query is not begun again at once, as GL's is: the game
+reads only a slot's latest test, so the earlier one's count may never have
+been read, and a Begin on a query whose results were not obtained abandons
+them (the debug layer's warning 408). It is retired instead, and its count
+read (and dropped) at later begins until it has one; then it is free for
+another test. The queries are made as the free ones run out, and kept. */
+
+#define QUERY_SLOTS 4096
+#define QUERY_RETIRED 256
+
+static struct
+{
+	ID3D11Query *slots[QUERY_SLOTS];
+	/* the scratch, and whether a test is open on it */
+	ID3D11Query *scratch;
+	int open;
+	/* queries replaced in their slot whose count is not read yet, and those
+	read, free for a test */
+	ID3D11Query *retired[QUERY_RETIRED];
+	uint32_t retired_count;
+	ID3D11Query *free[QUERY_RETIRED];
+	uint32_t free_count;
+	uint32_t begun;
+	int failed_logged;
+} Q;
+
+static ID3D11Query *query_make(void)
+{
+	D3D11_QUERY_DESC description;
+	ID3D11Query *query = NULL;
+	HRESULT result;
+
+	description.Query = D3D11_QUERY_OCCLUSION;
+	description.MiscFlags = 0;
+	result = ID3D11Device_CreateQuery(B.device, &description, &query);
+	if (backend_failed(result, "an occlusion query"))
+	{
+		if (!Q.failed_logged)
+		{
+			Q.failed_logged = 1;
+			platform_log("d3d11: an occlusion query was not made (%s): its tests answer 0 (logged once)",
+				hr_text(result));
+		}
+		return NULL;
+	}
+	return query;
+}
+
+/* the retired queries whose counts the GPU has given: read, and freed */
+static void queries_retire(void)
+{
+	uint32_t index = 0;
+
+	while (index < Q.retired_count)
+	{
+		UINT64 count;
+		HRESULT result = ID3D11DeviceContext_GetData(B.context, (ID3D11Asynchronous *)Q.retired[index], &count,
+			sizeof(count), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+
+		if (result == S_FALSE)
+		{
+			index++;
+			continue;
+		}
+		if (FAILED(result))
+			backend_failed(result, "GetData (a retired occlusion query)");
+		if (Q.free_count < QUERY_RETIRED)
+			Q.free[Q.free_count++] = Q.retired[index];
+		else
+			release(&Q.retired[index]);
+		Q.retired[index] = Q.retired[--Q.retired_count];
+	}
+}
+
+void d3d11_backend_query_begin(uint32_t slot)
+{
+	(void)slot;
+	if (!B.device || B.lost || Q.open)
+		return;
+	queries_retire();
+	if (!Q.scratch)
+		Q.scratch = Q.free_count ? Q.free[--Q.free_count] : query_make();
+	if (!Q.scratch)
+		return;
+	ID3D11DeviceContext_Begin(B.context, (ID3D11Asynchronous *)Q.scratch);
+	Q.open = 1;
+	Q.begun++;
+}
+
+void d3d11_backend_query_end(uint32_t slot)
+{
+	ID3D11Query *ended;
+
+	if (!B.device || B.lost || !Q.open)
+		return;
+	Q.open = 0;
+	ID3D11DeviceContext_End(B.context, (ID3D11Asynchronous *)Q.scratch);
+	if (slot >= QUERY_SLOTS)
+		return;
+	ended = Q.scratch;
+	Q.scratch = NULL;
+	/* (the slot's earlier query retired; with too many retired, the oldest
+	is let go of) */
+	if (Q.slots[slot])
+	{
+		if (Q.retired_count == QUERY_RETIRED)
+		{
+			release(&Q.retired[0]);
+			Q.retired[0] = Q.retired[--Q.retired_count];
+		}
+		Q.retired[Q.retired_count++] = Q.slots[slot];
+	}
+	Q.slots[slot] = ended;
+}
+
+int d3d11_backend_query_result(uint32_t slot, uint64_t *samples)
+{
+	UINT64 count = 0;
+	HRESULT result;
+
+	if (!B.device || B.lost || slot >= QUERY_SLOTS || !Q.slots[slot])
+		return 0;
+	result = ID3D11DeviceContext_GetData(B.context, (ID3D11Asynchronous *)Q.slots[slot], &count, sizeof(count),
+		D3D11_ASYNC_GETDATA_DONOTFLUSH);
+	/* (S_FALSE: not known yet) */
+	if (result != S_OK)
+	{
+		if (FAILED(result))
+			backend_failed(result, "GetData (an occlusion query)");
+		return 0;
+	}
+	*samples = count;
+	return 1;
+}
+
+static uint32_t queries_begun(void)
+{
+	return Q.begun;
 }
 
 void d3d11_backend_draw_release(void)
 {
 	uint32_t index;
+
+	for (index = 0; index < QUERY_SLOTS; index++)
+		release(&Q.slots[index]);
+	for (index = 0; index < Q.retired_count; index++)
+		release(&Q.retired[index]);
+	for (index = 0; index < Q.free_count; index++)
+		release(&Q.free[index]);
+	release(&Q.scratch);
+	memset(&Q, 0, sizeof(Q));
 
 	for (index = 0; index < SCRATCH_COUNT; index++)
 	{

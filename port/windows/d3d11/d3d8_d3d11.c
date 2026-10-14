@@ -423,6 +423,9 @@ struct vertex_shader_object
 
 /* ---------- the device */
 
+/* the game's visibility test slots (d3d8_gl.c's): slot 0 is never the game's */
+#define VISIBILITY_TEST_SLOTS 4096
+
 /* the stream and index rings (the backend's, D3D11_USAGE_DYNAMIC): the
 desktop's sizes in d3d8_gl.c */
 #define STREAM_BUFFER_SIZE (32 * 1024 * 1024)
@@ -471,7 +474,15 @@ struct d3d11_device
 	unsigned long stream_offset;
 	unsigned long index_offset;
 
+	/* the visibility tests (d3d8_gl.c's desktop path): whether one is open;
+	for each slot whether a test ended in it, the targets' pixels and
+	samples to a game pixel when it did, the latest count known (in the
+	game's pixels), and whether the slot's latest query is still to be read */
 	BOOL visibility_test_active;
+	BOOL query_pending[VISIBILITY_TEST_SLOTS];
+	float query_area[VISIBILITY_TEST_SLOTS];
+	UINT visibility_known[VISIBILITY_TEST_SLOTS];
+	BOOL visibility_unread[VISIBILITY_TEST_SLOTS];
 
 	unsigned long frame;
 	unsigned long next_vertex_shader_id;
@@ -1533,23 +1544,50 @@ void WINAPI D3DDevice_InsertCallback(D3DCALLBACKTYPE type, D3DCALLBACK callback,
 		callback(context);
 }
 
-/* ---------- visibility (occlusion) tests: none passes until the backend
-counts samples (phase 6), so lens flares stay dark */
+/* ---------- visibility (occlusion) tests
+
+d3d8_gl.c's desktop path, with the backend's occlusion queries
+(d3d11_backend_query_*) in place of the GL's: the draws between the begin
+and the end are counted on a scratch query, which the end swaps into the
+slot; a result is the latest count known, from this test or, while the GPU
+is behind, from the slot's earlier ones, and never waited for. */
 
 void WINAPI D3DDevice_BeginVisibilityTest(void)
 {
 	if (!device.backend_ready || device.visibility_test_active)
 		return;
 	device.visibility_test_active = TRUE;
+	d3d11_backend_query_begin(0);
 }
 
 HRESULT WINAPI D3DDevice_EndVisibilityTest(DWORD index)
 {
-	(void)index;
 	if (!device.backend_ready || !device.visibility_test_active)
 		return S_OK;
 	device.visibility_test_active = FALSE;
+	index %= VISIBILITY_TEST_SLOTS;
+	if (!index)
+		index = 1;
+	d3d11_backend_query_end((uint32_t)index);
+	/* the target's samples to a game pixel (its pixels, by its samples a
+	pixel with multisampling): the result is a count of the game's pixels
+	(visibility_unscaled), which the game divides by its own test's area
+	(lens flares, rasterizer_lights.c), a split-screen window's or the
+	screen's alike */
+	device.query_area[index] = target_scale[0] * target_scale[1] * (float)target_samples;
+	device.query_pending[index] = TRUE;
+	device.visibility_unread[index] = TRUE;
 	return S_OK;
+}
+
+/* a count of samples in the game's pixels */
+static UINT visibility_unscaled(uint64_t samples, DWORD index)
+{
+	float area = device.query_area[index];
+
+	if (area > 1.0f)
+		return (UINT)((float)samples / area + 0.5f);
+	return samples > 0xffffffffULL ? 0xffffffffU : (UINT)samples;
 }
 
 /* the main menu's line under the version number (menu_functions.c) */
@@ -1558,15 +1596,32 @@ char const *d3d8_renderer_description(void)
 	return "Direct3D 11";
 }
 
-/* 0 samples, always complete (never D3DERR_TESTINCOMPLETE, on which the game
-would spin) */
+/* the latest count known, always complete (never D3DERR_TESTINCOMPLETE, on
+which the game would spin): 0 for a slot never tested */
 HRESULT WINAPI D3DDevice_GetVisibilityTestResult(DWORD index, UINT *result, ULONGLONG *time_stamp)
 {
-	(void)index;
+	uint64_t samples;
+
 	if (time_stamp)
 		*time_stamp = 0;
+	index %= VISIBILITY_TEST_SLOTS;
+	if (!index)
+		index = 1;
+	if (!device.backend_ready || !device.query_pending[index])
+	{
+		if (result)
+			*result = 0;
+		return S_OK;
+	}
+	/* (from this test, or while the GPU is still behind, from the slot's
+	earlier ones) */
+	if (device.visibility_unread[index] && d3d11_backend_query_result((uint32_t)index, &samples))
+	{
+		device.visibility_known[index] = visibility_unscaled(samples, index);
+		device.visibility_unread[index] = FALSE;
+	}
 	if (result)
-		*result = 0;
+		*result = device.visibility_known[index];
 	return S_OK;
 }
 
@@ -5127,8 +5182,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 		platform_log("frame %lu: Direct3D 11; %lu draws, %lu immediate; skipped in 60 frames: %lu no "
 			"program, %lu no buffer, %lu no target, %lu not drawn; %lu clears (%lu by clear calls, %lu drawn), "
 			"%lu target changes, %lu targets; %lu KB mirrored, %lu KB streamed, %lu KB uploaded to %lu segments, %lu ring "
-			"discards; %lu binds skipped, %lu self-sampling copies, %lu resolves, %lu composite copies; %lu textures (%lu "
-			"KB), %lu texture writes (%lu KB); "
+			"discards; %lu binds skipped, %lu self-sampling copies, %lu resolves, %lu composite copies, %lu queries; %lu "
+			"textures (%lu KB), %lu texture writes (%lu KB); "
 			"%lu pixel keys, %lu vertex variants met; %lu presented, "
 			"%lu not; %lu swap chain resizes; %lu GL stub calls%s",
 			device.frame, stats.draws / stats.presents, stats.immediate_draws / stats.presents,
@@ -5147,6 +5202,8 @@ void WINAPI D3DDevice_Present(CONST RECT *source_rectangle, CONST RECT *destinat
 				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_RESOLVES]),
 			(unsigned long)(drawn[D3D11_BACKEND_DRAW_STATISTIC_COMPOSITE_COPIES] -
 				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_COMPOSITE_COPIES]),
+			(unsigned long)(drawn[D3D11_BACKEND_DRAW_STATISTIC_QUERIES] -
+				device.draw_statistics_before[D3D11_BACKEND_DRAW_STATISTIC_QUERIES]),
 			(unsigned long)drawn[D3D11_BACKEND_DRAW_STATISTIC_TEXTURES_ALIVE],
 			(unsigned long)drawn[D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_BYTES] / 1024,
 			(unsigned long)(drawn[D3D11_BACKEND_DRAW_STATISTIC_TEXTURE_WRITES] -

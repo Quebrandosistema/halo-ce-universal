@@ -546,6 +546,17 @@ y1 in its pixels from the top left), colour only: the game keeps values of
 its own in destination alpha. 1 if run. */
 int d3d11_backend_anti_alias(int smaa, uint32_t target, const int32_t corners[4]);
 
+/* ---------- visibility tests (step 6)
+
+The game's visibility tests as occlusion queries (D3D11_QUERY_OCCLUSION),
+one for each of the device's slots (0 to 4095), as d3d8_gl.c's desktop path
+keeps them: begun on a scratch query, which the end swaps into the slot. A
+result is never waited for: 1 and the samples that passed when the slot's
+latest query has answered, 0 while it has not (or there is none). */
+void d3d11_backend_query_begin(uint32_t slot);
+void d3d11_backend_query_end(uint32_t slot);
+int d3d11_backend_query_result(uint32_t slot, uint64_t *samples);
+
 /* what d3d11_backend_draw_statistics fills, totals since the start: the
 draws made; the binds the shadow skipped; the copies of a target sampled
 while it is drawn into; the textures' writes and their bytes; the textures
