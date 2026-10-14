@@ -233,9 +233,10 @@ struct d3d11_backend_layout_element
 
 /* the slot an input the elements do not feed is read from: the backend adds
 an element for each input of the vertex shader that count elements leave
-out, R32G32B32A32_FLOAT at semantic_index * 16 bytes, so that the layout can
-be made (a vertex buffer there with stride 0 gives every vertex the input's
-current value: phase 6) */
+out, at semantic_index * 16 bytes, four 32-bit components in the type the
+shader declares the input in (float, uint or int), as per-instance data at a
+step rate of 1, so that every vertex of a draw (one instance) reads the
+sixteen current values the draw's record carries (d3d11_backend_draw) */
 #define D3D11_BACKEND_ATTRIBUTE_SLOT 16u
 
 /* the input layout of these elements for the vertex shader's handle (whose

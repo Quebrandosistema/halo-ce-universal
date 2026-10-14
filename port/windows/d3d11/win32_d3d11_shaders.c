@@ -103,6 +103,9 @@ static struct
 {
 	HMODULE library;
 	pD3DCompile compile;
+	/* the load was tried (once: its absence is logged once, and not tried
+	again for each shader) */
+	int tried;
 	/* the DLL's file version ("10.0.26100.1" or "unknown"), read once */
 	char version[48];
 } compiler;
@@ -112,14 +115,17 @@ static int load_compiler(void)
 {
 	if (compiler.compile)
 		return 1;
+	if (compiler.tried)
+		return 0;
+	compiler.tried = 1;
 	compiler.library = LoadLibraryA("d3dcompiler_47.dll");
 	if (compiler.library)
 		compiler.compile = (pD3DCompile)(void *)GetProcAddress(compiler.library, "D3DCompile");
 	if (!compiler.compile)
 	{
 		platform_log("d3d11: the shader compiler is not available (d3dcompiler_47.dll: %s, error %lu): the "
-			"clears that are drawn are skipped and the window stays black", compiler.library ? "no D3DCompile" :
-			"not loaded", GetLastError());
+			"clears that are drawn are skipped and the window stays black (logged once)", compiler.library ?
+			"no D3DCompile" : "not loaded", GetLastError());
 		return 0;
 	}
 	return 1;
@@ -368,8 +374,14 @@ struct shader
 	void *bytecode;
 	uint32_t bytecode_size;
 	uint32_t inputs_declared, inputs_read;
+	/* each declared input's component type (D3D_REGISTER_COMPONENT_UINT32 1,
+	SINT32 2, FLOAT32 3): the format an element from the attribute slot reads
+	it in */
+	unsigned char input_types[VERTEX_INPUTS];
 	/* its compile failed this run (logged once) */
 	int failed;
+	/* a layout over it was not made (logged once a shader) */
+	int layout_failed_logged;
 };
 
 static struct
@@ -521,7 +533,7 @@ void d3d11_backend_shader_cache_enable(int enabled)
 	WIN32_FIND_DATAA found;
 	HANDLE search;
 	DWORD length;
-	uint32_t files = 0;
+	uint32_t files = 0, temporaries = 0;
 
 	if (C.said)
 		return;
@@ -586,8 +598,29 @@ void d3d11_backend_shader_cache_enable(int enabled)
 		} while (FindNextFileA(search, &found));
 		FindClose(search);
 	}
+	/* a .tmp a failed write left (cache_write) is removed: nothing reads it */
+	snprintf(pattern, sizeof(pattern), "%s\\*.tmp", C.folder);
+	search = FindFirstFileA(pattern, &found);
+	if (search != INVALID_HANDLE_VALUE)
+	{
+		do
+		{
+			char path[MAX_PATH];
+
+			if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+				continue;
+			snprintf(path, sizeof(path), "%s\\%s", C.folder, found.cFileName);
+			if (DeleteFileA(path))
+				temporaries++;
+		} while (FindNextFileA(search, &found));
+		FindClose(search);
+	}
 	C.on = 1;
-	platform_log("d3d11: shader cache %s: %u shaders on the disk", C.folder, files);
+	if (temporaries)
+		platform_log("d3d11: shader cache %s: %u shaders on the disk (%u .tmp files of failed writes removed)", C.folder,
+			files, temporaries);
+	else
+		platform_log("d3d11: shader cache %s: %u shaders on the disk", C.folder, files);
 }
 
 /* the file's header: magic, the format's version, the generator's, the hash,
@@ -666,6 +699,7 @@ static void *cache_read(uint32_t stage, uint64_t hash, uint32_t *code_size)
 	uint64_t stored_hash;
 	char target[9] = { 0 };
 
+	size.QuadPart = 0;
 	if (!C.on || index_find(&C.files, file_key(stage, hash)) != 1)
 		return NULL;
 	shader_path(path, sizeof(path), C.folder, stage, hash, ".dxbc");
@@ -721,12 +755,15 @@ static void *cache_read(uint32_t stage, uint64_t hash, uint32_t *code_size)
 }
 
 /* the TEXCOORD<n> inputs of a vertex shader's bytecode (its ISGN chunk):
-those declared and those it reads */
-static void input_signature(const unsigned char *code, uint32_t size, uint32_t *declared, uint32_t *read)
+those declared and those it reads, and each one's component type (the
+entry's word at 12: D3D_REGISTER_COMPONENT_UINT32 1, SINT32 2, FLOAT32 3) */
+static void input_signature(const unsigned char *code, uint32_t size, uint32_t *declared, uint32_t *read,
+	unsigned char types[VERTEX_INPUTS])
 {
 	uint32_t chunks, chunk, offset, chunk_size, count, element;
 
 	*declared = *read = 0;
+	memset(types, 0, VERTEX_INPUTS);
 	if (size < 32 || memcmp(code, "DXBC", 4))
 		return;
 	memcpy(&chunks, code + 28, 4);
@@ -745,17 +782,19 @@ static void input_signature(const unsigned char *code, uint32_t size, uint32_t *
 		for (element = 0; element < count && 8 + (element + 1) * 24 <= chunk_size; element++)
 		{
 			const unsigned char *entry = data + 8 + element * 24;
-			uint32_t name, semantic_index, system_value;
+			uint32_t name, semantic_index, system_value, component_type;
 
 			memcpy(&name, entry, 4);
 			memcpy(&semantic_index, entry + 4, 4);
 			memcpy(&system_value, entry + 8, 4);
+			memcpy(&component_type, entry + 12, 4);
 			if (name >= chunk_size || system_value || semantic_index >= VERTEX_INPUTS ||
 				strncmp((const char *)data + name, "TEXCOORD", chunk_size - name))
 			{
 				continue;
 			}
 			*declared |= 1u << semantic_index;
+			types[semantic_index] = (unsigned char)component_type;
 			if (entry[21])
 				*read |= 1u << semantic_index;
 		}
@@ -826,7 +865,7 @@ static int shader_object_make(struct shader *shader, void *code, uint32_t size)
 		free(shader->bytecode);
 		shader->bytecode = code;
 		shader->bytecode_size = size;
-		input_signature(code, size, &shader->inputs_declared, &shader->inputs_read);
+		input_signature(code, size, &shader->inputs_declared, &shader->inputs_read, shader->input_types);
 	}
 	else
 	{
@@ -956,7 +995,7 @@ uint32_t d3d11_backend_layout_make(const struct d3d11_backend_layout_element *el
 	uint32_t vertex_shader)
 {
 	D3D11_INPUT_ELEMENT_DESC descriptions[VERTEX_INPUTS * 2];
-	const struct shader *shader;
+	struct shader *shader;
 	ID3D11InputLayout *layout = NULL;
 	uint32_t index, handle, fed = 0, made = 0;
 	uint64_t key;
@@ -987,7 +1026,12 @@ uint32_t d3d11_backend_layout_make(const struct d3d11_backend_layout_element *el
 			fed |= 1u << elements[index].semantic_index;
 	}
 	/* the inputs the shader declares and the elements leave out, from the
-	attribute slot */
+	attribute slot: in the format the shader declares the input in (a packed
+	input is a uint, an integer one an int4: read as four floats the bits would
+	be another number's, and the layer says CREATEINPUTLAYOUT_TYPE_MISMATCH),
+	as per-instance data at a step rate of 1, so that every vertex of a
+	non-instanced draw (one instance) reads element 0 of the slot's buffer,
+	which Direct3D 11 documents, where a per-vertex stride of 0 is not promised */
 	for (index = 0; index < VERTEX_INPUTS; index++)
 	{
 		D3D11_INPUT_ELEMENT_DESC *description;
@@ -997,17 +1041,25 @@ uint32_t d3d11_backend_layout_make(const struct d3d11_backend_layout_element *el
 		description = &descriptions[made++];
 		description->SemanticName = "TEXCOORD";
 		description->SemanticIndex = index;
-		description->Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+		description->Format = shader->input_types[index] == D3D_REGISTER_COMPONENT_UINT32 ? DXGI_FORMAT_R32G32B32A32_UINT :
+			shader->input_types[index] == D3D_REGISTER_COMPONENT_SINT32 ? DXGI_FORMAT_R32G32B32A32_SINT :
+			DXGI_FORMAT_R32G32B32A32_FLOAT;
 		description->InputSlot = D3D11_BACKEND_ATTRIBUTE_SLOT;
 		description->AlignedByteOffset = index * 16;
-		description->InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
-		description->InstanceDataStepRate = 0;
+		description->InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA;
+		description->InstanceDataStepRate = 1;
 	}
 	result = ID3D11Device_CreateInputLayout(B.device, descriptions, made, shader->bytecode, shader->bytecode_size,
 		&layout);
 	if (backend_failed(result, "an input layout"))
 	{
-		object_failed(1, "the input layout for the vertex shader", result, shader->hash);
+		/* (once for each shader, not once in all) */
+		if (!shader->layout_failed_logged)
+		{
+			shader->layout_failed_logged = 1;
+			platform_log("d3d11: the input layout for the vertex shader %016llx was not made (%s; logged once for it)",
+				(unsigned long long)shader->hash, hr_text(result));
+		}
 		return 0;
 	}
 	handle = objects_add(&C.layouts, key, (IUnknown *)layout);
