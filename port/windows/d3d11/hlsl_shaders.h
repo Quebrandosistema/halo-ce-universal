@@ -29,7 +29,7 @@ include it; the key and the lighting are named by pointer only (xgpu.h).
 
 /* in every shader's identity (phase 5's cache): a change to the generators'
 text is a new version */
-#define HLSL_SHADER_GENERATOR_VERSION 2
+#define HLSL_SHADER_GENERATOR_VERSION 3
 
 #define HLSL_STRING(x) #x
 #define HLSL_REGISTER_TEXT(x) HLSL_STRING(x)

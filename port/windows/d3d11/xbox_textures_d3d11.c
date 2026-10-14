@@ -571,8 +571,12 @@ static uint32_t compressed_format(unsigned char kind)
 
 /* ---------- upload */
 
-/* debug.texture_dump_directory writes level 0 of every upload as a TGA, read back from the backend */
-static void texture_dump(uint32_t texture, uint32_t kind, const struct xgpu_texture_description *description)
+/* debug.texture_dump_directory writes level 0 of every upload as a TGA, read
+back from the backend; a BC texture's level 0 decoded from its texels instead
+(texels: the first face's level 0), as GL's read-back decompressed it: the
+backend reads back no compressed format */
+static void texture_dump(uint32_t texture, uint32_t kind, uint32_t format,
+	const struct xgpu_texture_description *description, const unsigned char *texels)
 {
 	static unsigned long dump_index = 0;
 	const char *directory = *config_string("debug.texture_dump_directory") ?
@@ -588,7 +592,13 @@ static void texture_dump(uint32_t texture, uint32_t kind, const struct xgpu_text
 	pixels = malloc(width * height * 4);
 	if (!pixels)
 		return;
-	if (!d3d11_backend_texture_read(texture, pixels, width * height * 4))
+	if (format != D3D11_BACKEND_TEXTURE_FORMAT_BGRA8 && format != D3D11_BACKEND_TEXTURE_FORMAT_RGBA8)
+	{
+		/* (the converted words, ARGB, are BGRA bytes here) */
+		dxt_decode_level(format_information(description->format).kind, texels, width, height, 1,
+			(unsigned long *)pixels);
+	}
+	else if (!d3d11_backend_texture_read(texture, pixels, width * height * 4))
 	{
 		free(pixels);
 		return;
@@ -727,16 +737,15 @@ static void reorder_channels(unsigned long *texels, unsigned long count, unsigne
 
 /* the backend's texture of an entry's description: its kind, the format (BC
 as it is where the texels keep the Xbox's channel order, else BGRA8) */
-static uint32_t texture_make(const struct xgpu_texture_description *description, BOOL compressed, uint32_t *kind)
+static uint32_t texture_make(const struct xgpu_texture_description *description, uint32_t format, uint32_t *kind)
 {
-	struct format_information information = format_information(description->format);
 	struct d3d11_backend_texture texture;
 
 	memset(&texture, 0, sizeof(texture));
 	*kind = description->cube_map ? D3D11_BACKEND_TEXTURE_KIND_CUBE :
 		description->depth > 1 ? D3D11_BACKEND_TEXTURE_KIND_3D : D3D11_BACKEND_TEXTURE_KIND_2D;
 	texture.kind = *kind;
-	texture.format = compressed ? compressed_format(information.kind) : D3D11_BACKEND_TEXTURE_FORMAT_BGRA8;
+	texture.format = format;
 	texture.width = (uint32_t)description->width;
 	texture.height = (uint32_t)description->height;
 	texture.depth = (uint32_t)description->depth;
@@ -745,11 +754,12 @@ static uint32_t texture_make(const struct xgpu_texture_description *description,
 }
 
 /* the texture written from the texels at base: made the first time (the
-entry's texture and kind), every level of every face; a texture whose
+entry's texture, kind and format), every level of every face; a texture whose
 channel order is not the Xbox's is decoded, a BC one too, and reordered */
-static void upload(uint32_t *texture, uint32_t *kind, const struct xgpu_texture_description *description,
-	const unsigned char *base, const D3DCOLOR *palette, unsigned char channel_order)
+static void upload(uint32_t *texture, uint32_t *kind, uint32_t *format,
+	const struct xgpu_texture_description *description, const unsigned char *base, const D3DCOLOR *palette, unsigned char channel_order)
 {
+	uint32_t wanted;
 	struct format_information information = format_information(description->format);
 	unsigned long face_count = description->cube_map ? 6 : 1;
 	unsigned long face_size = xgpu_texture_face_size(description);
@@ -767,9 +777,21 @@ static void upload(uint32_t *texture, uint32_t *kind, const struct xgpu_texture_
 		return;
 	}
 	/* (made once: an entry's description does not change, its key being the
-	format and size words; the texels it holds may, and are written again) */
+	format and size words; the texels it holds may, and are written again. The
+	format follows the texels' channel order, which other texels at the
+	address may change: the texture is made again in the other format then) */
+	wanted = description->compressed && !decode_compressed ? compressed_format(information.kind) :
+		D3D11_BACKEND_TEXTURE_FORMAT_BGRA8;
+	if (*texture && *format != wanted)
+	{
+		d3d11_backend_texture_free(*texture);
+		*texture = 0;
+	}
 	if (!*texture)
-		*texture = texture_make(description, description->compressed && !decode_compressed, kind);
+	{
+		*texture = texture_make(description, wanted, kind);
+		*format = wanted;
+	}
 	if (!*texture)
 	{
 		free(converted);
@@ -811,7 +833,7 @@ static void upload(uint32_t *texture, uint32_t *kind, const struct xgpu_texture_
 		}
 	}
 	free(converted);
-	texture_dump(*texture, *kind, description);
+	texture_dump(*texture, *kind, *format, description, base);
 }
 
 /* ---------- cache */
@@ -821,9 +843,11 @@ struct texture_entry
 	struct texture_entry *next;
 	DWORD data, format_word, size_word;
 	unsigned long palette_hash;
-	/* the backend's texture, 0 until the first upload made it, and its kind */
+	/* the backend's texture, 0 until the first upload made it, its kind and
+	its format (D3D11_BACKEND_TEXTURE_FORMAT_*) */
 	uint32_t texture;
 	uint32_t kind;
+	uint32_t format;
 	struct xgpu_texture_description description;
 	unsigned long address, size;
 	unsigned long generation;
@@ -1252,7 +1276,8 @@ void xgpu_d3d11_texture_get(const DWORD *resource, const D3DCOLOR *palette, stru
 					entry->description.height, entry->size, entry->generation,
 					ones * 100 / entry->size, zeros * 100 / entry->size);
 			}
-			upload(&entry->texture, &entry->kind, &entry->description, (const unsigned char *)entry->address, palette,
+			upload(&entry->texture, &entry->kind, &entry->format, &entry->description,
+				(const unsigned char *)entry->address, palette,
 				custom_edition_texels_order(entry->address));
 		}
 	}

@@ -22,7 +22,8 @@ For each .hlsl of the manifest:
 - compared with its GLSL twin: the HLSL must be exactly the twin with the
   dialect's changes (port/windows/D3D11.md, phase 4, "The dialect", items 1 to
   10, and phase 6's item 11: a manifest line marked constant_alpha=1 or 2 has
-  the one multiply by the blend constant's alpha before the return) applied,
+  the one multiply of the clamped colour by the blend constant's alpha
+  before the return) applied,
   the declarations written from hlsl_shaders.h's #defines and strings,
   whitespace aside. A shader that compiles and draws black is the
   failure this is for: it compiles, so only a comparison finds it.
@@ -340,9 +341,9 @@ def expected_pixel(gl_text, entry, macros):
         if match:
             # item 11 (phase 6): the manifest's constant_alpha mark means the one multiply line before the return
             if entry.get("constant_alpha") == "1":
-                body.append("result *= blend_constant.w;")
+                body.append("result = clamp(result, 0.0, 1.0) * blend_constant.w;")
             elif entry.get("constant_alpha") == "2":
-                body.append("result *= 1.0 - blend_constant.w;")
+                body.append("result = clamp(result, 0.0, 1.0) * (1.0 - blend_constant.w);")
             if coverage:
                 body.append("output.color = %s;" % match.group(1))
                 body.append("return output;")
@@ -642,6 +643,9 @@ CLASSES = (
      r"\(the original's arguments|const DWORD \*instructions = |unsigned long instruction_count = count;|"
      r"register combiners, as held in the pixel shader render states - into|Direct3D 11 renderer \(port/windows|"
      r"^4\)\. A copy of|^change it\) in which|hlsl_shaders\.h: nv2a_hlsl)"),
+    ("11 the source factor the constant's alpha, in the pixel shader (phase 6)",
+     r"blend_constant|constant's alpha|constant's colour: the transparent|four channels, after the alpha test|"
+     r"before the return \(blending reads|GL clamps the fragment"),
     ("1 the prologue: no #version, precision, layout, invariant; no Android branch",
      r"#version|precision|HALO_ANDROID|^#(ifdef|else|endif)|shading_language|SHADER_VERSION|invariant|"
      r"early_fragment|atomic_uint|count_samples|occlusion counter|samples that pass the depth|the #version line"),

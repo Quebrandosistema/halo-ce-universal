@@ -400,6 +400,9 @@ struct vertex_shader_object
 	/* as a declaration: its draws' layouts (draw_layout) */
 	struct declaration_layout layouts[DECLARATION_LAYOUTS];
 	unsigned long layout_count;
+	/* a stream of a stride its elements' formats do not align with was
+	copied at another (stream_data), said once for the declaration */
+	BOOL stride_logged;
 };
 
 /* ---------- the device */
@@ -2053,15 +2056,65 @@ static unsigned long index_upload(const void *data, unsigned long size)
 the GL renderer named its stream buffer there */
 #define STREAMED_IN_RING 0xffffffffu
 
+/* the bytes the input layout's format of an Xbox vertex type reads
+(attribute_format, below) */
+static unsigned long format_bytes(unsigned long type)
+{
+	switch (type)
+	{
+	case D3DVSDT_FLOAT1: return 4;
+	case D3DVSDT_FLOAT2: return 8;
+	case D3DVSDT_FLOAT3: case D3DVSDT_FLOAT2H: return 12;
+	case D3DVSDT_FLOAT4: return 16;
+	case D3DVSDT_SHORT1: case D3DVSDT_NORMSHORT1: return 2;
+	case D3DVSDT_SHORT2: case D3DVSDT_NORMSHORT2: return 4;
+	case D3DVSDT_SHORT3: case D3DVSDT_SHORT4: case D3DVSDT_NORMSHORT3: case D3DVSDT_NORMSHORT4: return 8;
+	case D3DVSDT_PBYTE1: return 1;
+	case D3DVSDT_PBYTE2: return 2;
+	default: return 4;
+	}
+}
+
+/* a stream whose stride is not a multiple of 4, which Direct3D 11's input
+assembler wants of a vertex buffer that an element reads (the debug layer's
+error 367), and the stride its vertices are copied at instead: the bytes its
+elements read, rounded up to 4. The zsprites' texture coordinates are such a
+stream (two bytes a vertex, rasterizer_xbox_transparent_geometry.c), which GL
+read as they are. 0 when the stride is a multiple of 4 (or 0). */
+static unsigned long stream_aligned_stride(const struct vertex_shader_object *declaration, unsigned long stream,
+	unsigned long stride, unsigned long *span)
+{
+	unsigned long index, end = 0;
+
+	for (index = 0; index < declaration->element_count; index++)
+	{
+		const struct vertex_element *element = &declaration->elements[index];
+		unsigned long bytes = format_bytes(element->type);
+
+		if (element->stream != stream || element->type == D3DVSDT_NONE)
+			continue;
+		if (element->offset + bytes > end)
+			end = element->offset + bytes;
+	}
+	*span = end;
+	if (!stride || stride % 4 == 0)
+		return 0;
+	return (end + 3) & ~3UL;
+}
+
 /* setup_streams' data work (d3d8_gl.c): each stream the draw's declaration
 reads, from the mirror where it can be, else streamed, placed in the record
 (the segment or the ring, the offset, the stride: the layout's elements name
-the slots, draw_layout); the attributes' values are draw_prepare's */
+the slots, draw_layout); the attributes' values are draw_prepare's. A stream
+whose stride is not aligned for its formats is streamed with each vertex's
+bytes copied at an aligned stride (stream_aligned_stride), the bytes GL read
+for it: past the stream's last vertex, zeros. */
 static void stream_data(unsigned long first, unsigned long count)
 {
 	struct vertex_shader_object *declaration = device.vertex_shader;
 	uint32_t stream_buffers[16];
 	unsigned long stream_offsets[16];
+	unsigned long aligned_strides[16] = { 0 }, spans[16] = { 0 };
 	BOOL placed[16] = { FALSE };
 	unsigned long index, total = 0;
 
@@ -2079,6 +2132,20 @@ static void stream_data(unsigned long first, unsigned long count)
 			continue;
 		placed[stream] = TRUE;
 		stream_buffers[stream] = 0;
+		aligned_strides[stream] = stream_aligned_stride(declaration, stream, stride, &spans[stream]);
+		if (aligned_strides[stream])
+		{
+			if (!declaration->stride_logged)
+			{
+				declaration->stride_logged = TRUE;
+				platform_log("Direct3D 11: stream %lu of stride %lu under declaration %lu (vertex shader %lu), whose "
+					"elements read %lu bytes of each vertex: its vertices are copied at a stride of %lu (logged once a "
+					"declaration)", stream, stride, declaration->id, current_program() ? current_program()->id : 0,
+					spans[stream], aligned_strides[stream]);
+			}
+			total += (aligned_strides[stream] * count + 15) & ~15UL;
+			continue;
+		}
 		base = (unsigned long)PLATFORM_PHYSICAL_TO_VIRTUAL(device.streams[stream].data) + first * stride;
 		if (mirror_range(base, bytes, &stream_buffers[stream], &stream_offsets[stream], NULL))
 			continue;
@@ -2094,7 +2161,39 @@ static void stream_data(unsigned long first, unsigned long count)
 
 		if (!device.streams[stream].data || element->type == D3DVSDT_NONE)
 			continue;
-		if (!stream_buffers[stream])
+		if (!stream_buffers[stream] && aligned_strides[stream])
+		{
+			const unsigned char *base = PLATFORM_PHYSICAL_TO_VIRTUAL(device.streams[stream].data) + first * stride;
+			unsigned long aligned = aligned_strides[stream], available = stride * count, vertex;
+			unsigned char *copy = calloc(count, aligned);
+
+			if (copy)
+			{
+				for (vertex = 0; vertex < count; vertex++)
+				{
+					unsigned long at = vertex * stride;
+					unsigned long bytes = spans[stream];
+
+					if (at + bytes > available)
+						bytes = available - at;
+					memcpy(copy + vertex * aligned, base + at, bytes);
+				}
+				stream_offsets[stream] = stream_upload(copy, aligned * count);
+				free(copy);
+			}
+			else
+			{
+				stream_offsets[stream] = stream_upload(base, aligned * count < available ? aligned * count : available);
+			}
+			stream_buffers[stream] = STREAMED_IN_RING;
+			stats.streamed_bytes += aligned * count;
+			stride = aligned;
+		}
+		else if (aligned_strides[stream])
+		{
+			stride = aligned_strides[stream];
+		}
+		else if (!stream_buffers[stream])
 		{
 			const unsigned char *base = PLATFORM_PHYSICAL_TO_VIRTUAL(device.streams[stream].data);
 			unsigned long bytes = stride ? stride * count : 64;

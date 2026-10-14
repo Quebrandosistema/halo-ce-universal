@@ -741,12 +741,13 @@ char *nv2a_hlsl_pixel_shader(const struct nv2a_pixel_shader_key *key, int by_con
 	/* the source blend factor the constant's alpha (with the destination's
 	the constant's colour: the transparent meter), taken into the colour, all
 	four channels, after the alpha test (which reads the shader's alpha) and
-	before the return (blending reads the product); the blend state's source
-	factors are ONE (d3d8_d3d11.c) */
+	before the return (blending reads the product), of the colour clamped as
+	GL clamps the fragment's colour before blending multiplies it; the blend
+	state's source factors are ONE (d3d8_d3d11.c) */
 	if (by_constant_alpha == HLSL_BY_CONSTANT_ALPHA)
-		xgpu_text_append(&text, "\tresult *= blend_constant.w;\n");
+		xgpu_text_append(&text, "\tresult = clamp(result, 0.0, 1.0) * blend_constant.w;\n");
 	else if (by_constant_alpha == HLSL_BY_INVERSE_CONSTANT_ALPHA)
-		xgpu_text_append(&text, "\tresult *= 1.0 - blend_constant.w;\n");
+		xgpu_text_append(&text, "\tresult = clamp(result, 0.0, 1.0) * (1.0 - blend_constant.w);\n");
 	if (coverage)
 		xgpu_text_append(&text, "\toutput.color = clamp(result, 0.0, 1.0);\n\treturn output;\n}\n");
 	else
