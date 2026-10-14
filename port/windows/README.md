@@ -60,11 +60,11 @@ The game finds the game data as on Linux. Refer to "Start the game" in
 `ninja windows` also makes `build\windows\halo_d3d11.exe`. This executable
 is the same game with a renderer that uses Direct3D 11 instead of OpenGL. The
 renderer is in development: refer to [D3D11.md](D3D11.md). At this time the
-executable draws the menus (the PC menus and the Xbox menus, with their
-art and their text) as `halo.exe` draws them, and the maps' geometry and
-textures; the render targets that the maps sample (the wake-up flash, the
-shadows, the water), the anti-aliasing passes and the visibility tests of
-the lens flares are the next steps. The settings `display.anti_aliasing`,
+executable draws the menus and the maps as `halo.exe` draws them: the PC
+menus and the Xbox menus with their art and their text, the maps' geometry
+and textures, the render targets that the maps sample (the wake-up flash,
+the zoom, the shadows, the water), multisampling, supersampling, the FXAA
+and SMAA passes, and the visibility tests of the lens flares. The settings `display.anti_aliasing`,
 `display.resolution_scaling`, `display.shadow_resolution`,
 `display.high_res_hud`, `display.high_res_text`, `display.menus`,
 `display.per_pixel_lighting`, `debug.texture_log`, `debug.texture_no_cache`,
@@ -106,7 +106,10 @@ shaders that the two folders have in common. The statistics line
 variants that the draws used since the start, the draws and the clears of
 each frame, the draws that were skipped and why, the textures and their
 size, the texture writes, the binds that the draw skipped because the state
-did not change, and the GL functions that the shared files called (zero).
+did not change, the copies of a render target that a draw samples while it
+draws into it, the resolves of the multisampled targets, the levels copied
+into the mip composites of the water, the visibility tests, and the GL
+functions that the shared files called (zero).
 
 `halo_d3d11.exe` compiles each shader the first time that a draw uses it,
 and keeps the compiled shader in a cache on the disk:
